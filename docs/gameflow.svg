@@ -1,0 +1,115 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 470" font-family="'Noto Sans SC','Microsoft YaHei',sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#faf6ec"/>
+      <stop offset="1" stop-color="#ece2ca"/>
+    </linearGradient>
+    <linearGradient id="card1" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fffdf6"/>
+      <stop offset="1" stop-color="#f2ead7"/>
+    </linearGradient>
+    <linearGradient id="card2" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fffdf6"/>
+      <stop offset="1" stop-color="#ece2cf"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7d9b6b"/>
+      <stop offset="1" stop-color="#5f7d4f"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 背景 -->
+  <rect x="8" y="8" width="1144" height="454" rx="22" fill="url(#bg)" stroke="#d6c69f" stroke-width="2"/>
+  <text x="580" y="50" text-anchor="middle" font-size="27" font-weight="bold" fill="#4a3f2b">卡卡颂 · 核心回合循环</text>
+  <text x="580" y="76" text-anchor="middle" font-size="14" fill="#7a6f57">顺时针轮转，直至 72 张地牌放置完毕；最后一张牌放置后进入终局计分</text>
+
+  <!-- 五个节点卡片，位置 x = 22, 258, 494, 730, 966，宽 172，y=100 h=210 -->
+  <g>
+    <!-- 节点1 抽牌 -->
+    <rect x="22" y="100" width="172" height="210" rx="14" fill="url(#card1)" stroke="#cbb98d" stroke-width="1.5"/>
+    <circle cx="108" cy="146" r="30" fill="#e8e0cc" stroke="#b7a87f" stroke-width="1.5"/>
+    <!-- 牌堆图标 -->
+    <rect x="90" y="132" width="36" height="28" rx="3" fill="#a8975f" stroke="#6f623f" stroke-width="1.5"/>
+    <rect x="95" y="137" width="26" height="4" rx="1" fill="#efe8d5"/>
+    <rect x="95" y="144" width="26" height="4" rx="1" fill="#efe8d5"/>
+    <text x="108" y="196" text-anchor="middle" font-size="18" font-weight="bold" fill="#3f3626">1 · 抽牌</text>
+    <text x="108" y="220" text-anchor="middle" font-size="12" fill="#6d624a">从牌堆随机抽 1 张</text>
+    <text x="108" y="238" text-anchor="middle" font-size="12" fill="#6d624a">展示给所有玩家</text>
+    <text x="108" y="266" text-anchor="middle" font-size="12" fill="#6d624a">（起始牌先置于中央）</text>
+
+    <!-- 箭头1 -->
+    <polyline points="196,205 232,205 232,160 252,160" fill="none" stroke="#8a7b55" stroke-width="2.5" marker-end="url(#arr)"/>
+    <polygon points="252,154 260,160 252,166" fill="#8a7b55"/>
+
+    <!-- 节点2 放置 -->
+    <rect x="258" y="100" width="172" height="210" rx="14" fill="url(#card2)" stroke="#cbb98d" stroke-width="1.5"/>
+    <circle cx="344" cy="146" r="30" fill="#e4e7d6" stroke="#9fb08a" stroke-width="1.5"/>
+    <!-- 棋盘网格+加号图标 -->
+    <rect x="326" y="132" width="36" height="28" rx="3" fill="#cfd8bd" stroke="#7f9168" stroke-width="1.5"/>
+    <line x1="338" y1="134" x2="338" y2="158" stroke="#7f9168" stroke-width="1.2"/>
+    <line x1="328" y1="146" x2="360" y2="146" stroke="#7f9168" stroke-width="1.2"/>
+    <text x="344" y="196" text-anchor="middle" font-size="18" font-weight="bold" fill="#3f3626">2 · 放置地块</text>
+    <text x="344" y="220" text-anchor="middle" font-size="12" fill="#6d624a">至少一边邻接已有地块</text>
+    <text x="344" y="238" text-anchor="middle" font-size="12" fill="#6d624a">邻接边地形必须匹配</text>
+    <text x="344" y="256" text-anchor="middle" font-size="12" fill="#6d624a">可旋转 4 个方向</text>
+    <text x="344" y="274" text-anchor="middle" font-size="12" fill="#8a6d3b">合法位置高亮提示</text>
+
+    <!-- 箭头2 -->
+    <polyline points="432,205 468,205 468,160 488,160" fill="none" stroke="#8a7b55" stroke-width="2.5"/>
+    <polygon points="488,154 496,160 488,166" fill="#8a7b55"/>
+
+    <!-- 节点3 部署米宝（可选） -->
+    <rect x="494" y="100" width="172" height="210" rx="14" fill="url(#card1)" stroke="#cbb98d" stroke-width="1.5"/>
+    <circle cx="580" cy="146" r="30" fill="#f1e2da" stroke="#c98d75" stroke-width="1.5"/>
+    <!-- 米宝小人图标 -->
+    <circle cx="580" cy="133" r="6" fill="#b3572f"/>
+    <path d="M572 158 l0 -14 q8 -8 16 0 l0 14 z" fill="#b3572f"/>
+    <text x="580" y="196" text-anchor="middle" font-size="18" font-weight="bold" fill="#3f3626">3 · 部署米宝</text>
+    <text x="580" y="216" text-anchor="middle" font-size="12" fill="#8a6d3b">可选 · 至多 1 个</text>
+    <text x="580" y="238" text-anchor="middle" font-size="12" fill="#6d624a">骑士/强盗/僧侣/农夫</text>
+    <text x="580" y="256" text-anchor="middle" font-size="12" fill="#6d624a">只能放刚放置的地块</text>
+    <text x="580" y="274" text-anchor="middle" font-size="12" fill="#6d624a">该特征段必须无人占据</text>
+
+    <!-- 箭头3 -->
+    <polyline points="668,205 704,205 704,160 724,160" fill="none" stroke="#8a7b55" stroke-width="2.5"/>
+    <polygon points="724,154 732,160 724,166" fill="#8a7b55"/>
+
+    <!-- 节点4 结算 -->
+    <rect x="730" y="100" width="172" height="210" rx="14" fill="url(#card2)" stroke="#cbb98d" stroke-width="1.5"/>
+    <circle cx="816" cy="146" r="30" fill="#e6e0ef" stroke="#9c8fc0" stroke-width="1.5"/>
+    <!-- 计分星星图标 -->
+    <path d="M816 128 l5 10 11 2 -8 8 2 11 -10 -5 -10 5 2 -11 -8 -8 11 -2 z" fill="#8a6fd0"/>
+    <text x="816" y="196" text-anchor="middle" font-size="18" font-weight="bold" fill="#3f3626">4 · 结算计分</text>
+    <text x="816" y="220" text-anchor="middle" font-size="12" fill="#6d624a">完成道路/城市/修道院</text>
+    <text x="816" y="238" text-anchor="middle" font-size="12" fill="#6d624a">多数者得分，平局均得</text>
+    <text x="816" y="256" text-anchor="middle" font-size="12" fill="#6d624a">即时滚动计分板</text>
+    <text x="816" y="274" text-anchor="middle" font-size="12" fill="#6d624a">计分后米宝归还</text>
+
+    <!-- 箭头4 -->
+    <polyline points="904,205 940,205 940,160 960,160" fill="none" stroke="#8a7b55" stroke-width="2.5"/>
+    <polygon points="960,154 968,160 960,166" fill="#8a7b55"/>
+
+    <!-- 节点5 下一玩家 -->
+    <rect x="966" y="100" width="172" height="210" rx="14" fill="url(#card1)" stroke="#cbb98d" stroke-width="1.5"/>
+    <circle cx="1052" cy="146" r="30" fill="#dde8e6" stroke="#7fa39c" stroke-width="1.5"/>
+    <!-- 循环箭头图标 -->
+    <path d="M1040 146 a12 12 0 1 1 24 0" fill="none" stroke="#4f8377" stroke-width="2.5"/>
+    <polygon points="1066,138 1066,156 1078,146" fill="#4f8377"/>
+    <text x="1052" y="196" text-anchor="middle" font-size="18" font-weight="bold" fill="#3f3626">5 · 下一玩家</text>
+    <text x="1052" y="220" text-anchor="middle" font-size="12" fill="#6d624a">顺时针轮到下一位</text>
+    <text x="1052" y="238" text-anchor="middle" font-size="12" fill="#6d624a">回到步骤 1 循环</text>
+    <text x="1052" y="274" text-anchor="middle" font-size="12" fill="#8a6d3b">最后一牌后 → 终局</text>
+  </g>
+
+  <!-- 底部终局结算条 -->
+  <rect x="22" y="336" width="1116" height="96" rx="14" fill="url(#accent)"/>
+  <text x="580" y="368" text-anchor="middle" font-size="16" font-weight="bold" fill="#ffffff">终局计分</text>
+  <text x="250" y="402" text-anchor="middle" font-size="13" fill="#f0f6ea">未完成道路 · 每张 1 分</text>
+  <text x="560" y="402" text-anchor="middle" font-size="13" fill="#f0f6ea">未完成城市 · 每段 1 分 + 旗帜 1 分</text>
+  <text x="890" y="402" text-anchor="middle" font-size="13" fill="#f0f6ea">农场 · 每个毗邻完成城市 3 分</text>
+  <text x="580" y="420" text-anchor="middle" font-size="12" fill="#dcead2">未完成修道院 · 每张 1 分（自身 + 周围）</text>
+
+  <!-- 从节点5 回到 节点1 的循环大箭头 -->
+  <path d="M1052 312 L1052 322 Q1052 328 1046 328 L114 328 Q108 328 108 322 L108 312" fill="none" stroke="#8a7b55" stroke-width="3" stroke-dasharray="8 6"/>
+  <polygon points="102,310 108,324 114,310" fill="#8a7b55"/>
+</svg>
