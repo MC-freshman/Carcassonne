@@ -10,6 +10,152 @@ from typing import Dict, Optional
 from .engine import COLOR_HEX
 from .ui_common import FONT, FONT_S, FONT_L
 
+# ---------------------------------------------------------------- 扩展开关
+
+# (key, 名称, 简述)：顺序 = 牌堆/快照中的扩展开关顺序
+EXPANSIONS = [
+    ("inns", "客栈与大教堂", "18 张新牌，双倍/三倍计分与大型米宝"),
+    ("traders", "商人与建造者", "24 张新牌，贸易商品/双回合/猪"),
+    ("pd", "公主与龙", "30 张新牌，龙移动/仙女/公主/传送门"),
+    ("abbey", "修道院与市长", "12 张新牌，市长/粮仓/马车"),
+    ("king", "国王与强盗男爵", "5 张新牌，最大城/最长路记号"),
+    ("river", "河流 II", "12 张河流起始牌，替代起始修道院"),
+    ("shrine", "教堂与异端", "5 张新牌，教堂挑战修道院"),
+    ("count", "卡卡颂伯爵", "城块四区，计分前可移入随从"),
+    ("bcb", "桥城堡集市", "12 张新牌，木桥/城堡回响/集市拍卖"),
+    ("besiegers", "围攻", "6 张新牌，被围城 1 分/牌，可脱困"),
+    ("festival", "节日", "10 张新牌，可收回场上任一己方图元"),
+    ("goldmines", "金矿", "9 张新牌，金块随完成特征归属多数者"),
+    ("magewitch", "法师与女巫", "9 张新牌，法师加分/女巫减半"),
+    ("robbers", "强盗", "9 张新牌，轨道强盗偷走得分一半"),
+    ("tunnel", "隧道", "4 张新牌，同色双令牌地下接通道路"),
+    ("crop", "麦田怪圈", "6 张新牌，全体部署同伴或收回随从"),
+    ("phantom", "幽灵", "每色第二枚普通随从"),
+    ("tower", "塔", "18 张新牌，建塔抓随从/赎金 3 分"),
+    ("hillsheep", "山丘与羊", "18 张新牌，叠牌/牧羊人/葡萄园"),
+    ("wheel", "命运之轮", "19 张命运牌，轮盘事件/王冠位"),
+]
+
+_BG = "#3f4a35"
+_SEL_BG = "#2f3627"
+_GOLD = "#e8c96a"
+_GRAY = "#a89f82"
+
+
+def _bind_wheel(widget: tk.Misc, canvas: tk.Canvas) -> None:
+    """滚轮滚动面板（Windows delta 为 120 的倍数）。"""
+    def on_wheel(e):
+        canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+        return "break"
+    widget.bind("<MouseWheel>", on_wheel)
+
+
+def _bind_wheel_tree(widget: tk.Misc, canvas: tk.Canvas) -> None:
+    _bind_wheel(widget, canvas)
+    for child in widget.winfo_children():
+        _bind_wheel_tree(child, canvas)
+
+
+def clamp_to_screen(win: tk.Misc, margin: int = 30) -> None:
+    """窗口底边超出屏幕时上移（小屏展开扩展面板后仍能看到底部按钮）。"""
+    if not win.winfo_exists():
+        return
+    win.update_idletasks()
+    # 标题栏高度：winfo_rooty 指向客户区，winfo_y 指向窗口框
+    frame_extra = max(0, win.winfo_rooty() - win.winfo_y())
+    h = max(win.winfo_height(), win.winfo_reqheight()) + frame_extra
+    room = win.winfo_screenheight() - margin
+    y = win.winfo_y()
+    if y + h > room:
+        target = max(20, room - h)
+        if target != y:
+            win.geometry("+%d+%d" % (win.winfo_x(), target))
+
+
+class ExpansionPanel:
+    """可折叠的扩展开关面板（20 项平铺会超出小屏）。
+
+    折叠时只占一行标题（含已选计数）；展开时限高滚动并可全选/清空。
+    选择结果按 EXPANSIONS 顺序经 selected() 返回。
+    """
+
+    def __init__(self, parent: tk.Misc, detail: bool = True,
+                 reserve: int = 620) -> None:
+        self.vars = {key: tk.BooleanVar(value=False)
+                     for key, _name, _desc in EXPANSIONS}
+        self._open = False
+        # 展开高度随屏幕收缩，保证对话框整体不超屏
+        self._body_h = max(120, min(200, parent.winfo_screenheight() - reserve))
+        self.frame = tk.Frame(parent, bg=_BG)
+        head = tk.Frame(self.frame, bg=_BG)
+        head.pack(fill="x")
+        self._btn = tk.Button(head, text="", font=FONT_S, bg=_BG, fg=_GOLD,
+                              activebackground=_BG, activeforeground="#f0e6c8",
+                              relief="flat", bd=0, anchor="w", cursor="hand2",
+                              command=self.toggle)
+        self._btn.pack(side="left")
+        for txt, val in (("清空", False), ("全选", True)):
+            tk.Button(head, text=txt, font=FONT_S, bg=_SEL_BG, fg="#cfc49f",
+                      activebackground="#465239", activeforeground="white",
+                      relief="flat", padx=6, cursor="hand2",
+                      command=lambda v=val: self.set_all(v)
+                      ).pack(side="right", padx=(4, 0))
+        self._body = tk.Frame(self.frame, bg=_BG)
+        self._canvas = tk.Canvas(self._body, bg=_BG, highlightthickness=0,
+                                 height=self._body_h, width=480)
+        vsb = ttk.Scrollbar(self._body, orient="vertical",
+                            command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=vsb.set)
+        self._canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        inner = tk.Frame(self._canvas, bg=_BG)
+        self._win = self._canvas.create_window((0, 0), window=inner,
+                                               anchor="nw")
+        inner.bind("<Configure>", lambda e: self._canvas.configure(
+            scrollregion=self._canvas.bbox("all")))
+        self._canvas.bind("<Configure>", lambda e: self._canvas.itemconfigure(
+            self._win, width=e.width))
+        for key, name, desc in EXPANSIONS:
+            text = "%s（%s）" % (name, desc) if detail else name
+            tk.Checkbutton(inner, text=text, variable=self.vars[key],
+                           font=FONT_S, bg=_BG, fg=_GOLD, activebackground=_BG,
+                           selectcolor=_SEL_BG, anchor="w").pack(anchor="w",
+                                                                 fill="x")
+        _bind_wheel_tree(inner, self._canvas)
+        _bind_wheel(self._canvas, self._canvas)
+        for var in self.vars.values():
+            var.trace_add("write", lambda *_: self._refresh())
+        self._refresh()
+        # 窗口尺寸随展开/折叠变化后若越出屏幕则上移（Configure 驱动，
+        # 不用定时器：对话框销毁后不会留下悬挂回调）
+        top = self.frame.winfo_toplevel()
+        top.bind("<Configure>", self._on_configure, add="+")
+
+    def _on_configure(self, event: tk.Event) -> None:
+        if event.widget is self.frame.winfo_toplevel():
+            clamp_to_screen(event.widget)
+
+    def selected(self) -> list:
+        return [key for key, _name, _desc in EXPANSIONS
+                if self.vars[key].get()]
+
+    def set_all(self, value: bool) -> None:
+        for var in self.vars.values():
+            var.set(value)
+
+    def toggle(self) -> None:
+        self._open = not self._open
+        if self._open:
+            self._body.pack(fill="x", pady=(2, 4))
+            self._canvas.yview_moveto(0)
+        else:
+            self._body.pack_forget()
+        self._refresh()
+
+    def _refresh(self) -> None:
+        self._btn.configure(text="%s 扩展（已选 %d / %d）" % (
+            "▾" if self._open else "▸", len(self.selected()), len(EXPANSIONS)))
+
 
 # ---------------------------------------------------------------- 设置界面
 
@@ -76,70 +222,9 @@ def setup_dialog():
 
     result: List[dict] = []
 
-    exp_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(dlg, text="扩展：客栈与大教堂（18 张新牌，双倍/三倍计分与大型米宝）",
-                   variable=exp_var, font=FONT_S, bg="#3f4a35", fg="#e8c96a",
-                   activebackground="#3f4a35", selectcolor="#2f3627",
-                   anchor="w").pack(anchor="w", padx=24, pady=(0, 2))
-    tb_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(dlg, text="扩展：商人与建造者（24 张新牌，贸易商品/双回合/猪）",
-                   variable=tb_var, font=FONT_S, bg="#3f4a35", fg="#e8c96a",
-                   activebackground="#3f4a35", selectcolor="#2f3627",
-                   anchor="w").pack(anchor="w", padx=24, pady=(0, 2))
-    pd_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(dlg, text="扩展：公主与龙（30 张新牌，龙移动/仙女/公主/传送门）",
-                   variable=pd_var, font=FONT_S, bg="#3f4a35", fg="#e8c96a",
-                   activebackground="#3f4a35", selectcolor="#2f3627",
-                   anchor="w").pack(anchor="w", padx=24, pady=(0, 2))
-    am_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(dlg, text="扩展：修道院与市长（12 张新牌，市长/粮仓/马车）",
-                   variable=am_var, font=FONT_S, bg="#3f4a35", fg="#e8c96a",
-                   activebackground="#3f4a35", selectcolor="#2f3627",
-                   anchor="w").pack(anchor="w", padx=24, pady=(0, 2))
-    kr_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(dlg, text="扩展：国王与强盗男爵（5 张新牌，最大城/最长路记号）",
-                   variable=kr_var, font=FONT_S, bg="#3f4a35", fg="#e8c96a",
-                   activebackground="#3f4a35", selectcolor="#2f3627",
-                   anchor="w").pack(anchor="w", padx=24, pady=(0, 2))
-    ri_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(dlg, text="扩展：河流 II（12 张河流起始牌，替代起始修道院）",
-                   variable=ri_var, font=FONT_S, bg="#3f4a35", fg="#e8c96a",
-                   activebackground="#3f4a35", selectcolor="#2f3627",
-                   anchor="w").pack(anchor="w", padx=24, pady=(0, 2))
-    sh_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(dlg, text="扩展：教堂与异端（5 张新牌，教堂挑战修道院）",
-                   variable=sh_var, font=FONT_S, bg="#3f4a35", fg="#e8c96a",
-                   activebackground="#3f4a35", selectcolor="#2f3627",
-                   anchor="w").pack(anchor="w", padx=24, pady=(0, 2))
-    cc_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(dlg, text="扩展：卡卡颂伯爵（城块四区，计分前可移入随从）",
-                   variable=cc_var, font=FONT_S, bg="#3f4a35", fg="#e8c96a",
-                   activebackground="#3f4a35", selectcolor="#2f3627",
-                   anchor="w").pack(anchor="w", padx=24, pady=(0, 2))
-    bcb_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(dlg, text="扩展：桥城堡集市（12 张新牌，木桥/城堡回响/集市拍卖）",
-                   variable=bcb_var, font=FONT_S, bg="#3f4a35", fg="#e8c96a",
-                   activebackground="#3f4a35", selectcolor="#2f3627",
-                   anchor="w").pack(anchor="w", padx=24, pady=(0, 2))
-    mini_vars = {}
-    for key, txt in (
-            ("besiegers", "扩展：围攻（6 张新牌，被围城 1 分/牌，可脱困）"),
-            ("festival", "扩展：节日（10 张新牌，可收回场上任一己方图元）"),
-            ("goldmines", "扩展：金矿（9 张新牌，金块随完成特征归属多数者）"),
-            ("magewitch", "扩展：法师与女巫（9 张新牌，法师加分/女巫减半）"),
-            ("robbers", "扩展：强盗（9 张新牌，轨道强盗偷走得分一半）"),
-            ("tunnel", "扩展：隧道（4 张新牌，同色双令牌地下接通道路）"),
-            ("crop", "扩展：麦田怪圈（6 张新牌，全体部署同伴或收回随从）"),
-            ("phantom", "扩展：幽灵（每色第二枚普通随从）"),
-            ("tower", "扩展：塔（18 张新牌，建塔抓随从/赎金 3 分）"),
-            ("hillsheep", "扩展：山丘与羊（18 张新牌，叠牌/牧羊人/葡萄园）"),
-            ("wheel", "扩展：命运之轮（19 张命运牌，轮盘事件/王冠位）")):
-        v = tk.BooleanVar(value=False)
-        mini_vars[key] = v
-        tk.Checkbutton(dlg, text=txt, variable=v, font=FONT_S,
-                       bg="#3f4a35", fg="#e8c96a",
-                       activebackground="#3f4a35", selectcolor="#2f3627",
-                       anchor="w").pack(anchor="w", padx=24, pady=(0, 2))
+    panel = ExpansionPanel(dlg, detail=True, reserve=430)
+    panel.frame.pack(anchor="w", fill="x", padx=20, pady=(2, 0))
+    dlg._exp_panel = panel   # 供 UI 自动化断言（verify_ui）
 
     def on_start() -> None:
         for i, r in enumerate(rows):
@@ -148,17 +233,7 @@ def setup_dialog():
                 "is_ai": r["is_ai"].get(),
                 "ai_level": r["level"].get(),
             })
-        expansions = ((["inns"] if exp_var.get() else []) +
-                      (["traders"] if tb_var.get() else []) +
-                      (["pd"] if pd_var.get() else []) +
-                      (["abbey"] if am_var.get() else []) +
-                      (["king"] if kr_var.get() else []) +
-                      (["river"] if ri_var.get() else []) +
-                      (["shrine"] if sh_var.get() else []) +
-                      (["count"] if cc_var.get() else []) +
-                      (["bcb"] if bcb_var.get() else []) +
-                      [k for k, v in mini_vars.items() if v.get()])
-        dlg.expansions = expansions
+        dlg.expansions = panel.selected()
         dlg.destroy()
 
     tk.Button(dlg, text="开始游戏", font=FONT_L, command=on_start,
@@ -200,8 +275,6 @@ def mode_dialog() -> Optional[Dict[str, object]]:
              font=FONT_S, bg="#3f4a35", fg="#c9c0a2").pack(pady=(0, 14))
 
     result: Dict[str, object] = {}
-    host_exp = tk.BooleanVar(value=False)
-    host_tb = tk.BooleanVar(value=False)
 
     def _close() -> None:
         dlg.destroy()
@@ -250,81 +323,15 @@ def mode_dialog() -> Optional[Dict[str, object]]:
         result.update({"kind": "host", "seats": seats,
                        "ai_count": ai_var.get(),
                        "name": host_name.get().strip() or "房主",
-                       "expansions": (["inns"] if host_exp.get() else []) +
-                                     (["traders"] if host_tb.get() else []) +
-                                     (["pd"] if host_pd.get() else []) +
-                                     (["abbey"] if host_am.get() else []) +
-                                     (["king"] if host_kr.get() else []) +
-                                     (["river"] if host_ri.get() else []) +
-                                     (["shrine"] if host_sh.get() else []) +
-                                     (["count"] if host_cc.get() else []) +
-                                     (["bcb"] if host_bcb.get() else []) +
-                                     [k for k, v in host_mini.items()
-                                      if v.get()]})
+                       "expansions": host_panel.selected()})
         _close()
 
-    tk.Checkbutton(host_box, text="扩展：客栈与大教堂（需全员统一）",
-                   variable=host_exp, font=FONT_S, bg="#3f4a35", fg="#e8c96a",
-                   activebackground="#3f4a35", selectcolor="#2f3627",
-                   anchor="w").pack(anchor="w", padx=10)
-    tk.Checkbutton(host_box, text="扩展：商人与建造者（需全员统一）",
-                   variable=host_tb, font=FONT_S, bg="#3f4a35", fg="#e8c96a",
-                   activebackground="#3f4a35", selectcolor="#2f3627",
-                   anchor="w").pack(anchor="w", padx=10)
-    host_pd = tk.BooleanVar(value=False)
-    tk.Checkbutton(host_box, text="扩展：公主与龙（需全员统一）",
-                   variable=host_pd, font=FONT_S, bg="#3f4a35", fg="#e8c96a",
-                   activebackground="#3f4a35", selectcolor="#2f3627",
-                   anchor="w").pack(anchor="w", padx=10)
-    host_am = tk.BooleanVar(value=False)
-    tk.Checkbutton(host_box, text="扩展：修道院与市长（需全员统一）",
-                   variable=host_am, font=FONT_S, bg="#3f4a35", fg="#e8c96a",
-                   activebackground="#3f4a35", selectcolor="#2f3627",
-                   anchor="w").pack(anchor="w", padx=10)
-    host_kr = tk.BooleanVar(value=False)
-    tk.Checkbutton(host_box, text="扩展：国王与强盗男爵（需全员统一）",
-                   variable=host_kr, font=FONT_S, bg="#3f4a35", fg="#e8c96a",
-                   activebackground="#3f4a35", selectcolor="#2f3627",
-                   anchor="w").pack(anchor="w", padx=10)
-    host_ri = tk.BooleanVar(value=False)
-    tk.Checkbutton(host_box, text="扩展：河流 II（需全员统一）",
-                   variable=host_ri, font=FONT_S, bg="#3f4a35", fg="#e8c96a",
-                   activebackground="#3f4a35", selectcolor="#2f3627",
-                   anchor="w").pack(anchor="w", padx=10)
-    host_sh = tk.BooleanVar(value=False)
-    tk.Checkbutton(host_box, text="扩展：教堂与异端（需全员统一）",
-                   variable=host_sh, font=FONT_S, bg="#3f4a35", fg="#e8c96a",
-                   activebackground="#3f4a35", selectcolor="#2f3627",
-                   anchor="w").pack(anchor="w", padx=10)
-    host_cc = tk.BooleanVar(value=False)
-    tk.Checkbutton(host_box, text="扩展：卡卡颂伯爵（需全员统一）",
-                   variable=host_cc, font=FONT_S, bg="#3f4a35", fg="#e8c96a",
-                   activebackground="#3f4a35", selectcolor="#2f3627",
-                   anchor="w").pack(anchor="w", padx=10)
-    host_bcb = tk.BooleanVar(value=False)
-    tk.Checkbutton(host_box, text="扩展：桥城堡集市（需全员统一）",
-                   variable=host_bcb, font=FONT_S, bg="#3f4a35", fg="#e8c96a",
-                   activebackground="#3f4a35", selectcolor="#2f3627",
-                   anchor="w").pack(anchor="w", padx=10)
-    host_mini = {}
-    for key, txt in (
-            ("besiegers", "扩展：围攻（需全员统一）"),
-            ("festival", "扩展：节日（需全员统一）"),
-            ("goldmines", "扩展：金矿（需全员统一）"),
-            ("magewitch", "扩展：法师与女巫（需全员统一）"),
-            ("robbers", "扩展：强盗（需全员统一）"),
-            ("tunnel", "扩展：隧道（需全员统一）"),
-            ("crop", "扩展：麦田怪圈（需全员统一）"),
-            ("phantom", "扩展：幽灵（需全员统一）"),
-            ("tower", "扩展：塔（需全员统一）"),
-            ("hillsheep", "扩展：山丘与羊（需全员统一）"),
-            ("wheel", "扩展：命运之轮（需全员统一）")):
-        v = tk.BooleanVar(value=False)
-        host_mini[key] = v
-        tk.Checkbutton(host_box, text=txt, variable=v, font=FONT_S,
-                       bg="#3f4a35", fg="#e8c96a",
-                       activebackground="#3f4a35", selectcolor="#2f3627",
-                       anchor="w").pack(anchor="w", padx=10)
+    tk.Label(host_box, text="扩展（需全员统一，创建房间后不可更改）",
+             font=FONT_S, bg=_BG, fg=_GRAY, anchor="w").pack(
+                 anchor="w", padx=10, pady=(2, 0))
+    host_panel = ExpansionPanel(host_box, detail=False, reserve=700)
+    host_panel.frame.pack(anchor="w", fill="x", padx=10, pady=(2, 0))
+    dlg._exp_panel = host_panel   # 供 UI 自动化断言（verify_ui）
     tk.Label(host_box, text="AI 座位由主机代打；好友随时可加入替换空位。"
              "人手不够就调高 AI 数，凑齐了想纯人对战可重建房间。",
              font=FONT_S, bg="#3f4a35", fg="#a89f82", wraplength=440,

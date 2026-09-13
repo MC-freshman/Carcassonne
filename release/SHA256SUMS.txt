@@ -1,7 +1,7 @@
-# 卡卡颂 v0.15.1 产物完整性清单（SHA256）
+# 卡卡颂 v0.15.2 产物完整性清单（SHA256）
 # 校验：certutil -hashfile <文件> SHA256
 
 29ef157d7f7b523e806814a1b0ab94b324b6c2f8fbcc40814fcc9dfff1d7cfdb  使用说明.txt
-eceb5931e0f9fca0fbd7975771e606209976b55359d3d251c4734e28268f21bb  卡卡颂.exe
-7c66b47337831527b850defbfc14e295ebde417b3c86c3d9a8de5618e4dd859a  卡卡颂_v0.15.1_win64_便携版.zip
-1e3fb32ca92eb02eaf47b6894f145ef60792bf25e43ceac191226389bc92ecca  版本说明.txt
+615941ab5fdec3d66230186feebcd850ffbf565bc8760cf7b8ad11dbabb2064b  卡卡颂.exe
+a8ec209b3c4405ee81953a471e6be1a36b6750aa23bdc9784f0d76471ddde07a  卡卡颂_v0.15.2_win64_便携版.zip
+d830e44d988b0fabc428233edb4a4cba8ec8fb9bf5979f39b0e683df550adbc4  版本说明.txt
