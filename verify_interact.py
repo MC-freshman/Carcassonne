@@ -45,6 +45,7 @@ def run() -> None:
     app.update_idletasks()
     app.update()
     app.after = lambda ms, fn, *a, **k: None  # 测试禁用定时调度，避免幽灵推进
+    app._ai_async = False
 
     # --- 1) 非法格点击：远离棋盘的空格应触发提示，不崩溃
     eng = app.engine

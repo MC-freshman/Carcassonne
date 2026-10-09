@@ -2,16 +2,48 @@
 """UI 共享常量与程序化绘制（自 ui.py 拆出，M14）。"""
 from __future__ import annotations
 
+import os
+import sys
+
 import tkinter as tk
 from typing import Tuple
 
 from .board import KIND_CITY, KIND_FARM, KIND_MON, KIND_ROAD
+from .engine import COLOR_HEX, PLAYER_COLORS
 from .models import TileDef
 
-TILE = 84            # 棋盘上每张牌的像素尺寸
-PREVIEW = 168        # 右侧当前牌预览尺寸（贴图 master 尺寸）
-GRID_ORIGIN = 1024   # 网格 (0,0) 的固定画布坐标：画布坐标不随滚动变化，
-                     # 滚动后 refresh 不会把视图拉回中心
+
+def _system_dpi() -> int:
+    """Windows 高分屏：进程级 DPI 感知 + 真实 DPI（须在窗口创建前调用）。
+
+    Tk 的点阵字体随 tk scaling 自动放大；画布像素尺寸（TILE/PREVIEW/
+    米宝贴图）用下面的 DPI_SCALE 手动缩放。CARCASSONNE_NO_DPI=1 可回退
+    旧的无感知行为（DWM 位图拉伸，清晰度差但几何与历史版本一致）。
+    """
+    if sys.platform != "win32" or os.environ.get("CARCASSONNE_NO_DPI"):
+        return 96
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+        try:
+            return int(ctypes.windll.user32.GetDpiForSystem())
+        except Exception:
+            return 96
+    except Exception:
+        return 96
+
+
+_DPI = _system_dpi()
+DPI_SCALE = max(1.0, _DPI / 96.0)
+
+TILE = int(84 * DPI_SCALE)            # 棋盘上每张牌的像素尺寸（96dpi=84）
+PREVIEW = int(168 * DPI_SCALE)        # 右侧当前牌预览尺寸（贴图 master 尺寸）
+MEEPLE_PX = int(round(28 * DPI_SCALE))     # 普通米宝显示尺寸（牌面的 1/3）
+MEEPLE_BIG_PX = int(round(40 * DPI_SCALE))  # 大型米宝（I&C）
+GRID_ORIGIN = 1024 + int((TILE - 84) * 8)   # 原点外扩，保证大贴图下负坐标牌可滚动到
 FONT = ("Microsoft YaHei", 10)
 FONT_S = ("Microsoft YaHei", 9)
 FONT_L = ("Microsoft YaHei", 13, "bold")
@@ -145,15 +177,37 @@ def draw_tile(cv: tk.Canvas, tile: TileDef, rot: int, ox: float, oy: float,
 
 def draw_meeple(cv: tk.Canvas, px: float, py: float, size: float, color: str,
                 farmer: bool = False, tags: str = "meeple") -> None:
-    """在 (px,py) 画一个米宝（农夫为横躺椭圆）。"""
+    """无贴图时的回退画法：与 art.py 的剪影同形（size 为牌面边长）。"""
     fill = COLOR_HEX.get(color, "#888")
-    r = size * 0.085
+    s = size * 0.33
     if farmer:
-        cv.create_oval(px - r * 1.35, py - r * 0.7, px + r * 1.35, py + r * 0.7,
-                       fill=fill, outline="white", width=1, tags=tags)
+        def q(x: float, y: float) -> Tuple[float, float]:
+            return px - s / 2 + y * s, py - s / 2 + (1.0 - x) * s
     else:
-        cv.create_oval(px - r, py - r, px + r, py + r, fill=fill,
-                       outline="white", width=1, tags=tags)
-        cv.create_oval(px - r * 0.45, py - r * 0.95, px + r * 0.45, py - r * 0.05,
-                       fill=fill, outline="white", width=1, tags=tags)
+        def q(x: float, y: float) -> Tuple[float, float]:
+            return px - s / 2 + x * s, py - s / 2 + y * s
+
+    for a, b in (((0.42, 0.40), (0.075, 0.545)),
+                 ((0.58, 0.40), (0.925, 0.545))):
+        ax, ay = q(*a)
+        bx, by = q(*b)
+        w = max(3, int(s * 0.14))
+        cv.create_line(ax, ay, bx, by, fill="white", width=w + 3,
+                       capstyle="round", tags=tags)
+        cv.create_line(ax, ay, bx, by, fill=fill, width=w,
+                       capstyle="round", tags=tags)
+    cv.create_polygon([q(*p) for p in ((0.335, 0.30), (0.665, 0.30),
+                                       (0.80, 0.955), (0.585, 0.955),
+                                       (0.50, 0.66), (0.415, 0.955),
+                                       (0.20, 0.955))],
+                      fill=fill, outline="white", width=2, tags=tags)
+    hr = s * 0.155
+    hx, hy = q(0.5, 0.175)
+    cv.create_oval(hx - hr, hy - hr, hx + hr, hy + hr, fill=fill,
+                   outline="white", width=2, tags=tags)
+    bx, by = q(0.5, 0.47)
+    if color in PLAYER_COLORS:
+        cv.create_text(bx, by, text=str(PLAYER_COLORS.index(color) + 1),
+                       font=("Microsoft YaHei", 8, "bold"),
+                       fill="white", tags=tags)
 

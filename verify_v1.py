@@ -196,7 +196,7 @@ def run_one_game(seed: int, n_players: int = 2, farm_rate: float = 0.0,
         turns += 1
         assert turns < 10000, "对局未收敛"
         random_player_turn(eng, rng)
-        placed += 1
+    placed = len(eng.board.tiles)
 
     # 终局计分（重复调用幂等：第二次应返回空）
     ev1 = eng.final_scoring()

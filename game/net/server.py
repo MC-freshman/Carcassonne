@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import queue
 import random
 import socket
 import threading
@@ -15,6 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from .. import tile_data
 from ..bot_ai import BotAI
+from .. import ai_turn
 from ..engine import CarcassonneEngine
 from ..models import meeple_majority
 from .protocol import recv_msg, send_msg
@@ -30,10 +32,59 @@ class Seat:
         self.level = level
         self.conn: Optional[socket.socket] = None
         self.addr: Optional[str] = None
+        # 每座位发送队列 + 独立写线程：广播（lobby/snap/over）只入队，
+        # 绝不在引擎主锁内做阻塞 sendall。此前一个僵死客户端会把
+        # _broadcast 卡在锁内，冻结整台主机的所有玩家。
+        self.outq: "queue.Queue" = queue.Queue(maxsize=8)
 
     @property
     def connected(self) -> bool:
         return self.is_ai or self.conn is not None
+
+    def attach(self, conn: socket.socket) -> None:
+        """绑定连接并启动写线程（重连时旧线程因 conn 换新自动退出）。
+
+        每条连接换新队列：旧写线程持有旧队列的引用，物理上不可能
+        消费发往新连接的消息（否则旧写线程会在出队后才发现归属已变，
+        把新连接的应答发进废弃 socket，重连的 join 应答凭空丢失）。
+        """
+        self.outq = queue.Queue(maxsize=8)
+        self.conn = conn
+        threading.Thread(target=self._write_loop, args=(conn,),
+                         daemon=True).start()
+
+    def send_async(self, msg: Dict[str, Any]) -> None:
+        """锁内安全发送：入队即返回；队列满视为客户端失能，弃连。"""
+        if self.conn is None:
+            return
+        try:
+            self.outq.put_nowait(msg)
+        except queue.Full:
+            self._drop_conn(self.conn, "发送队列溢出")
+
+    @staticmethod
+    def _drop_conn(conn: Optional[socket.socket], reason: str) -> None:
+        """只关闭传入的那条连接（绝不误伤座位当前的新连接）。"""
+        if conn is not None:
+            try:
+                conn.close()   # recv 线程随即报错，走统一清理路径
+            except OSError:
+                pass
+
+    def _write_loop(self, conn: socket.socket) -> None:
+        outq = self.outq   # 绑定本连接的队列（重连后旧线程留在旧队列上）
+        while self.conn is conn:
+            try:
+                item = outq.get(timeout=5)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            try:
+                send_msg(conn, item)
+            except OSError:
+                self._drop_conn(conn, "写线程发送失败")
+                break
 
 
 class GameServer:
@@ -85,6 +136,7 @@ class GameServer:
         except OSError:
             pass
         for s in self.seats:
+            s.outq.put(None)   # 唤醒写线程退出
             if s.conn:
                 try:
                     s.conn.close()
@@ -147,10 +199,16 @@ class GameServer:
             if self._started:
                 for s in self.seats:
                     if not s.is_ai and s.name == name and s.conn is None:
-                        s.conn, s.addr = conn, addr
+                        s.addr = addr
+                        s.attach(conn)
                         self._broadcast_lobby(exclude=conn)
                         if self.engine:
-                            send_msg(conn, self._snap_msg([]))
+                            # 应答与补发快照都走该座位队列，保证客户端
+                            # 先收到 lobby（知道 you）再收到 snap
+                            s.send_async({"t": "lobby", "you": s.idx,
+                                          "seats": self._lobby_seats()})
+                            s.send_async(self._snap_msg([]))
+                            return s, None
                         return s, {"t": "lobby", "you": s.idx,
                                    "seats": self._lobby_seats()}
                 return None, {"t": "error", "msg": "对局已开始且无此玩家座位"}
@@ -167,7 +225,8 @@ class GameServer:
             if target is None:
                 return None, {"t": "error", "msg": "房间已满"}
             target.name = name
-            target.conn, target.addr = conn, addr
+            target.addr = addr
+            target.attach(conn)
             self._broadcast_lobby(exclude=conn)
             return target, {"t": "lobby", "you": target.idx,
                             "seats": self._lobby_seats()}
@@ -526,180 +585,23 @@ class GameServer:
     def _advance_and_broadcast(self, new_events: List) -> None:
         """AI 回合与断线者代打，直到轮到在线人类；随后广播。"""
         eng = self.engine
-        # P&D：龙阶段的 AI/断线决策者代走
-        if eng.phase == "dragon":
-            guard = 0
-            while eng.phase == "dragon" and guard < 12:
-                guard += 1
-                dec = eng.dragon_decider_player()
-                if dec is None:
-                    break
-                seat = self.seats[dec.idx]
-                if dec.is_ai or not seat.connected:
-                    legal = eng.dragon_legal_steps()
-                    if not legal:
-                        break   # 龙阶段在 _advance_dragon 内自动结束
-                    bot = self.bots.get(dec.idx) or BotAI("normal", seed=self._seed)
-                    pos = bot.choose_dragon_step(eng, legal)
-                    eng.dragon_move(pos)
-                else:
-                    break
         guard = 0
-        while not eng.game_over and guard < 600:
+        while not eng.game_over and guard < 5000:
             guard += 1
-            # M18 伯爵城：重部署回合（当前决策者代走/等待）
-            if eng.phase == "redeploy":
-                st = eng.redeploy_state()
-                if st is None:
-                    continue
-                pidx = st["player"]
-                if self.seats[pidx].connected and not eng.players[pidx].is_ai:
-                    break   # 等人类决策
-                bot = self.bots.get(pidx) or BotAI("normal", seed=self._seed)
-                eng.redeploy_move(bot.choose_redeploy(eng))
-                continue
-            if eng.phase == "castle" and eng._castle_queue:
-                meta = eng.board._meta[eng._castle_queue[0]]
-                winners, _t = (eng._city_majority(meta) if meta.mayors
-                               else meeple_majority(meta.meeples))
-                occ = eng._player_by_color(winners[0] if winners
-                                           else eng.current_player().color)
-                if self.seats[occ.idx].connected and not occ.is_ai:
-                    break
-                bot = self.bots.get(occ.idx) or BotAI("normal", seed=self._seed)
-                eng.convert_castle(bot.choose_castle(eng))
-                continue
-            if eng.phase == "bazaar" and eng.bazaar:
-                b = eng.bazaar
-                if b["phase"] == "select":
-                    idx = b["selector"]
-                elif b["phase"] == "bid":
-                    idx = b.get("bid_turn")
-                elif b["phase"] == "decide":
-                    idx = b["selector"]
-                else:
-                    idx = None
-                if idx is None:
-                    continue
-                if self.seats[idx].connected and not eng.players[idx].is_ai:
-                    break
-                bot = self.bots.get(idx) or BotAI("normal", seed=self._seed)
-                act = bot.choose_bazaar(eng)
-                if not act:
-                    if b["phase"] == "bid":
-                        eng.bazaar_pass()
-                    elif b["phase"] == "decide":
-                        eng.bazaar_resolve(False)
-                    elif b["phase"] == "select":
-                        eng.bazaar_select(0, 0)
-                elif act[0] == "select":
-                    eng.bazaar_select(act[1], act[2] if len(act) > 2 else 0)
-                elif act[0] == "bid":
-                    eng.bazaar_bid(act[1])
-                elif act[0] == "pass":
-                    eng.bazaar_pass()
-                elif act[0] == "resolve":
-                    eng.bazaar_resolve(bool(act[1]) if len(act) > 1 else False)
-                continue
-            # M20 迷你扩展阶段代打（决策者=当前回合玩家）
-            if eng.phase in ("gold", "magewitch", "tunnel", "escape"):
-                pidx = eng.turn_idx
-                if self.seats[pidx].connected and not eng.players[pidx].is_ai:
-                    break
-                bot = self.bots.get(pidx) or BotAI("normal", seed=self._seed)
-                if eng.phase == "gold":
-                    eng.place_gold(bot.choose_gold(eng))
-                elif eng.phase == "magewitch":
-                    fig, node = bot.choose_mw(eng)
-                    if node is None:
-                        eng.mw_remove(fig)
-                    else:
-                        eng.mw_move(fig, node)
-                elif eng.phase == "tunnel":
-                    node = bot.choose_tunnel(eng)
-                    if node is None:
-                        eng.tunnel_skip()
-                    else:
-                        eng.tunnel_claim(node)
-                else:
-                    node = bot.choose_escape(eng)
-                    eng.escape_move(node)
-                continue
-            if eng.phase == "crop" and eng.crop:
-                if eng.crop["mode"] is None:
-                    idx = eng._placer_idx
-                else:
-                    idx = eng.crop["order"][eng.crop["pos"]]
-                if self.seats[idx].connected and not eng.players[idx].is_ai:
-                    break
-                bot = self.bots.get(idx) or BotAI("normal", seed=self._seed)
-                act = bot.choose_crop(eng)
-                if eng.crop["mode"] is None:
-                    eng.crop_choose(act or "A")
-                else:
-                    eng.crop_act(act)
-                continue
-            if eng.phase == "robber" and eng.robber_phase:
-                idx = eng.robber_phase["order"][eng.robber_phase["pos"]]
-                if self.seats[idx].connected and not eng.players[idx].is_ai:
-                    break
-                bot = self.bots.get(idx) or BotAI("normal", seed=self._seed)
-                eng.robber_place(bot.choose_robber(eng))
-                continue
-            # M18 伯爵城：进城部署（放置者代走/等待）
-            if eng.phase == "count_deploy":
-                pidx = eng._placer_idx
-                if self.seats[pidx].connected and not eng.players[pidx].is_ai:
-                    break
-                bot = self.bots.get(pidx) or BotAI("normal", seed=self._seed)
-                act = bot.choose_count_deploy(eng)
-                if act is None:
-                    eng.skip_count_deploy()
-                else:
-                    eng.deploy_count(act["option"]["quarter"],
-                                     act["option"]["fig"],
-                                     act.get("count_move_to"))
-                continue
-            cur = eng.players[eng.turn_idx]
-            seat = self.seats[cur.idx]
-            if seat.connected and not cur.is_ai:
+            player = eng.decision_player()
+            if player is None:
+                raise RuntimeError("AI 阶段缺少决策者：%s" % eng.phase)
+            if self.seats[player.idx].connected and not player.is_ai:
                 break
-            bot = self.bots.get(cur.idx) or BotAI("normal", seed=self._seed)
-            if eng.phase in ("place", "river"):
-                tries = 0
-                while not eng.legal_placements():
-                    eng.discard_and_redraw()
-                    tries += 1
-                    if eng.game_over or tries > 20:
-                        break
-                if eng.game_over or not eng.legal_placements():
-                    continue
-                (x, y, rot), _ = bot.choose_move(eng)
-                eng.place(x, y, rot)
-            elif eng.phase == "deploy":
-                # M21：塔动作优先（建塔/驻塔/赎金；无动作再常规部署）
-                tpos = bot.choose_tower_piece(eng)
-                if tpos is not None:
-                    eng.tower_place(tpos[0], tpos[1])
-                    continue
-                ttop = bot.choose_tower_top(eng)
-                if ttop is not None:
-                    eng.tower_deploy_top(ttop)
-                    continue
-                ridx = bot.choose_ransom(eng)
-                if ridx is not None:
-                    eng.ransom(ridx)
-                    continue
-                opt = bot.choose_deploy(eng)
-                if opt is not None:
-                    phantom = bool(eng._phantom_step) and opt["kind"] in (
-                        "city", "road", "farm", "mon")
-                    eng.deploy(opt["kind"], opt["seg"], pos=opt.get("pos"),
-                               victim=opt.get("victim"),
-                               victim_color=opt.get("victim_color"),
-                               phantom=phantom)
-                else:
-                    eng.skip_deploy()
+            bot = self.bots.get(player.idx) or BotAI("normal", seed=self._seed)
+            try:
+                chosen = ai_turn.choose_action(eng, bot)
+            except Exception:
+                traceback.print_exc()
+                chosen = ai_turn.choose_action(eng, bot, neutral=True)
+            ai_turn.apply_action(eng, chosen, atomic=True)
+        if guard >= 5000 and not eng.game_over:
+            raise RuntimeError("AI 连续行动超过上限：%s" % eng.phase)
         if eng.events and len(eng.events) > self._sent_events:
             new_events = eng.events[self._sent_events:] + list(new_events)
             self._sent_events = len(eng.events)
@@ -722,10 +624,7 @@ class GameServer:
     def _broadcast_lobby(self, exclude: Optional[socket.socket] = None) -> None:
         for s in self.seats:
             if s.conn is not None and s.conn is not exclude:
-                try:
-                    send_msg(s.conn, {"t": "lobby", "seats": self._lobby_seats()})
-                except OSError:
-                    s.conn = None
+                s.send_async({"t": "lobby", "seats": self._lobby_seats()})
 
     def _snap_msg(self, events: List, over: bool = False) -> Dict[str, Any]:
         ev = [{"kind": e.kind, "reason": e.reason,
@@ -735,10 +634,7 @@ class GameServer:
                 "snap": self.engine.snapshot_dict(), "events": ev}
 
     def _broadcast(self, msg: Dict[str, Any]) -> None:
+        """只入队不发送：写线程负责实际 sendall（见 Seat.send_async）。"""
         for s in self.seats:
             if s.conn is not None:
-                try:
-                    send_msg(s.conn, msg)
-                except OSError:
-                    if s.conn is not None:
-                        s.conn = None
+                s.send_async(msg)

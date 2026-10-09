@@ -36,7 +36,8 @@ def main() -> None:
     if "--quick" in sys.argv:
         _quick()
         return
-    if "--demo" in sys.argv or "--demo-inns" in sys.argv             or "--demo-traders" in sys.argv:
+    if ("--demo" in sys.argv or "--demo-inns" in sys.argv
+            or "--demo-traders" in sys.argv):
         _demo()
         return
 

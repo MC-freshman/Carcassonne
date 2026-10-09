@@ -1693,6 +1693,11 @@ def by_id(tile_id: str) -> TileDef:
     return _DEFS_BY_ID[tile_id]
 
 
+def registered_definitions() -> List[TileDef]:
+    """完整注册表，包含全部扩展和特殊起始牌，供素材生成与发布校验使用。"""
+    return list(_DEFS_BY_ID.values())
+
+
 def validate() -> Dict[str, object]:
     """数据自检：基础版与四个扩展的总量、拓扑分布、段-边一致性、旗帜合法性。
 

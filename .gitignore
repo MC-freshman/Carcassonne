@@ -10,6 +10,7 @@ Thumbs.db
 # 构建产物（由 build_release.py 生成，发布走 GitHub Release）
 release/*.exe
 release/*.zip
+release/备份/
 
 # 官方版权材料（不入库：CAR 规则书、官方计分板、抽取页、官方图标）
 docs/S-CAR_v7.4.pdf

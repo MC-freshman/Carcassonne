@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import random
+import time
 from typing import Dict, List, Optional, Tuple
 
 from .board import KIND_CITY, KIND_FARM, KIND_MON, KIND_ROAD
@@ -21,19 +22,33 @@ Move = Tuple[Tuple[int, int, int], Optional[Tuple[str, int]]]
 
 
 class BotAI:
-    def __init__(self, level: str = "normal", seed: Optional[int] = None):
+    def __init__(self, level: str = "normal", seed: Optional[int] = None,
+                 time_budget_ms: int = 500):
         assert level in ("easy", "normal", "hard")
         self.level = level
         self.rng = random.Random(seed)
+        self.time_budget_ms = time_budget_ms
+        self.cancel_event = None
+        self.last_stats = {}
+
+    def _expired(self):
+        return ((self.cancel_event is not None and self.cancel_event.is_set()) or
+                time.perf_counter() >= getattr(self, "_deadline", float("inf")))
 
     # ------------------------------------------------------------ 入口
 
     def choose_move(self, eng: CarcassonneEngine) -> Move:
+        started = time.perf_counter()
+        self._deadline = started + self.time_budget_ms / 1000
         placements = eng.legal_placements()
         assert placements, "无合法放置（应由引擎弃牌重抽流程处理）"
-        if self.level == "easy":
-            return self._easy(eng, placements)
-        return self._greedy(eng, placements)
+        try:
+            if self.level == "easy":
+                return self._easy(eng, placements)
+            return self._greedy(eng, placements)
+        finally:
+            self.last_stats["elapsed_ms"] = (time.perf_counter() - started) * 1000
+            self.last_stats["placements"] = len(placements)
 
     def choose_redeploy(self, eng: CarcassonneEngine) -> bool:
         """伯爵城重部署回合：本区有己方随从则全部移入（移入只会增益）。"""
@@ -127,21 +142,15 @@ class BotAI:
         me = eng.current_player().color
         best = None
         for pos, captures in opts:
-            gain = 0
-            for node in captures:
-                meta = eng.board._meta[eng.board.find(node)]
-                for n, c, _s in meta.meeple_nodes:
-                    if n == node and c != me:
-                        gain += 1
+            enemies = [node for node in captures
+                       if any(n == node and color != me for n, color, _ in
+                              eng.board.meta(node).meeple_nodes)]
+            gain = len(enemies)
             if best is None or gain > best[0]:
-                best = (gain, pos, captures)
+                best = (gain, pos, enemies)
         gain, pos, captures = best
         if gain > 0:
-            victim = next(n for n in captures
-                          if eng.board._meta[eng.board.find(n)].meeples.get(
-                              [m for m in eng.players
-                               if m.color != me][0].color, 0) > 0)
-            return (pos, victim)
+            return (pos, captures[0])
         # 无目标：50% 概率仍建塔（占位防御）
         return (pos, None) if self.rng.random() < 0.5 else None
 
@@ -151,7 +160,9 @@ class BotAI:
         if not opts:
             return None
         me = eng.current_player()
-        return opts[0] if me.meeples_left <= 2 and self.rng.random() < 0.6             else None
+        if me.meeples_left <= 2 and self.rng.random() < 0.6:
+            return opts[0]
+        return None
 
     def choose_plague(self, eng: CarcassonneEngine) -> Optional[Node]:
         """瘟疫：收回第一枚己方场上随从（无则跳过）。"""
@@ -190,7 +201,7 @@ class BotAI:
     def choose_dragon_step(self, eng: CarcassonneEngine,
                            legal: List[Tuple[int, int]]) -> Tuple[int, int]:
         """龙移动决策：贪心走向最近非己方图元，远离己方密集区。"""
-        my = eng.current_player().color
+        my = eng.decision_player().color
         best, best_s = None, None
         for pos in legal:
             # 评估：该格邻近 2 格内的敌我图元数
@@ -297,6 +308,7 @@ class BotAI:
                 open_cnt = 0
                 shared = 0
                 merged = None
+                roots = set()
                 for e in edges:
                     npos = board.neighbor(x, y, e)
                     if npos is None:
@@ -305,7 +317,11 @@ class BotAI:
                     shared += 1
                     other = seg_finders[kind](npos, OPPOSITE[e])
                     if other is not None:
-                        root_meta = board.meta((npos[0], npos[1], kind, other))
+                        root = board.find((npos[0], npos[1], kind, other))
+                        if root in roots:
+                            continue
+                        roots.add(root)
+                        root_meta = board._meta[root]
                         if merged is None:
                             merged = root_meta
                         else:
@@ -317,12 +333,14 @@ class BotAI:
                 pennants = (merged.pennants if merged else 0) + \
                     (seg[1] if kind == KIND_CITY and seg[1] else 0)
                 mine = (merged.meeples.get(my_color, 0) if merged else 0)
-                theirs = sum(merged.meeples.get(c, 0) for c in opp_colors) if merged else 0
+                theirs = max((merged.meeples.get(c, 0) for c in opp_colors), default=0) if merged else 0
                 pts = 0
                 if completes and kind == KIND_CITY:
-                    pts = (3 if flag else 2) * (len(n_tiles) + pennants)
+                    pts = (3 if flag or (merged and merged.cathedrals) else 2) * (len(n_tiles) + pennants)
                     if "traders" in eng.expansions:
                         pts += sum(len(cs.goods) for cs in tile.cities) * 3
+                elif completes and kind == KIND_ROAD:
+                    pts = (2 if flag or (merged and merged.inns) else 1) * len(n_tiles)
                 out[kind].append({
                     "idx": idx, "edges": edges, "open_after": after_open,
                     "completes": completes, "points": pts,
@@ -334,6 +352,7 @@ class BotAI:
                     # 在此段部署 1 个米宝后能否与对手形成平局或多数
                     # （接入争不赢的特征 = 白送米宝，hard 只在可争夺时介入）
                     "can_contest": theirs > 0 and mine + 1 >= theirs,
+                    "roots": roots,
                 })
         return out
 
@@ -347,6 +366,8 @@ class BotAI:
         scored: List[Tuple[float, Tuple[int, int, int], Optional[Tuple[str, int]]]] = []
 
         for (x, y, rot) in placements:
+            if scored and self._expired():
+                break
             info = self._prospects(eng, x, y, rot)
             s_place = 0.0
             # 1) 放置即完成 → 按完成后的多数归属估值：
@@ -415,6 +436,7 @@ class BotAI:
             elif abs(total - best_score) <= 1e-9:
                 best.append(((x, y, rot), deploy))
 
+        self.last_stats = {"evaluated": len(scored), "simulated": 0}
         if self.level == "hard":
             scored.sort(key=lambda t: -t[0])
             picked = self._lookahead(eng, scored[:6])
@@ -423,27 +445,25 @@ class BotAI:
         return self.rng.choice(best)
 
     def _lookahead(self, eng, candidates, k: int = 6):
-        """1 步前瞻：对静态分 top-K 的候选做快照重建模拟，
+        """1 步前瞻：对静态分 top-K 的候选做完整规则副本模拟，
         按（即时分差 + 特征潜力）选最优；模拟失败回退静态首选。"""
-        from .engine import CarcassonneEngine
-        try:
-            snap = eng.snapshot_dict()
-        except Exception:
-            return None
         my_idx = eng.current_player().idx
         best_total = None
         best_move = None
         for _static, move, deploy in candidates[:k]:
+            if self._expired():
+                break
             x, y, rot = move
             try:
-                rep = CarcassonneEngine.from_dict(snap)
+                rep = eng.clone_for_simulation()
+                rep._simulation_stop_before_draw = True
                 rep.place(x, y, rot)
-                if rep.phase == "deploy" and deploy:
-                    rep.deploy(deploy[0], deploy[1])
-                else:
-                    rep.skip_deploy()
-            except (AssertionError, KeyError):
+                deploy_hint = deploy
+                if not self._drive_sim(rep, deploy_hint):
+                    continue
+            except (AssertionError, KeyError, AttributeError, IndexError):
                 continue
+            self.last_stats["simulated"] = self.last_stats.get("simulated", 0) + 1
             mine = rep.players[my_idx].score
             opp = max((p.score for i, p in enumerate(rep.players) if i != my_idx),
                       default=0)
@@ -451,6 +471,104 @@ class BotAI:
             if best_total is None or total > best_total:
                 best_total, best_move = total, (move, deploy)
         return best_move
+
+    def _drive_sim(self, rep, deploy) -> bool:
+        """把模拟副本推进到本放置的计分完成（含迷你/特殊阶段）。
+
+        各阶段一律取中性选择（跳过/首个合法目标）；部署按提示执行一次。
+        推进到下一位玩家的放置/河流阶段（或终局）返回 True；卡死则 False。
+        旧版只处理 deploy 阶段，含迷你扩展时 skip_deploy 断言失败导致
+        全部候选被跳过、前瞻静默退化——本方法消除该降级。
+        """
+        guard = 0
+        deployed = False
+        while not rep.game_over and guard < 32:
+            if self._expired():
+                return False
+            guard += 1
+            ph = rep.phase
+            if ph in ("place", "river", "over"):
+                return True
+            if ph == "deploy":
+                if deploy and not deployed:
+                    deployed = True
+                    opt = next((o for o in rep.deploy_options()
+                                if (o["kind"], o["seg"]) == deploy and not o.get("big")), None)
+                    if opt is not None:
+                        rep.deploy_option(opt)
+                    else:
+                        rep.skip_deploy()
+                else:
+                    rep.skip_deploy()
+            elif ph == "gold":
+                opts = rep.gold_options()
+                if not opts:
+                    return False
+                rep.place_gold(opts[0])
+            elif ph == "magewitch":
+                fig = "mage" if rep.mage is not None else "witch"
+                nodes = rep.mw_options().get(fig) or []
+                if nodes:
+                    rep.mw_move(fig, nodes[0])
+                else:
+                    rep.mw_remove(fig)
+            elif ph == "tunnel":
+                rep.tunnel_skip()
+            elif ph == "escape":
+                rep.escape_move(None)
+            elif ph == "crop" and rep.crop:
+                if rep.crop["mode"] is None:
+                    rep.crop_choose("B")
+                else:
+                    copts = rep.crop_options()
+                    rep.crop_act(copts[0]["node"] if copts else None)
+            elif ph == "robber" and rep.robber_phase:
+                rep.robber_place(None)
+            elif ph == "shepherd":
+                rep.shepherd_act(False)
+            elif ph == "plague" and rep.plague:
+                popts = rep.plague_options()
+                rep.plague_act(popts[0] if popts else None)
+            elif ph == "redeploy":
+                rep.redeploy_move(False)
+            elif ph == "count_deploy":
+                rep.skip_count_deploy()
+            elif ph == "castle":
+                rep.convert_castle(False)
+            elif ph == "bazaar" and rep.bazaar:
+                return True  # 本次计分已结束，不评估下一轮隐藏牌堆。
+            elif ph == "dragon":
+                legal = rep.dragon_legal_steps()
+                if not legal:
+                    return False
+                rep.dragon_move(legal[0])
+            else:
+                return False
+        return rep.phase in ("place", "river", "over") or rep.game_over
+
+    def _farm_bonus(self, eng: CarcassonneEngine, node) -> float:
+        """农场部署加分（hard）：毗邻完成城 0.9/座、未完成城 0.35/座。
+
+        口径对齐终局农场 3 分/城的期望价值，封顶避免农场信号压过即时得分。
+        """
+        try:
+            root = eng.board.find(node)
+        except KeyError:
+            return 0.0
+        done = open_n = 0
+        cities = set()
+        for fnode, cnode in eng.board.farm_city_pairs:
+            if eng.board.find(fnode) != root:
+                continue
+            croot = eng.board.find(cnode)
+            if croot in cities:
+                continue
+            cities.add(croot)
+            if eng.board._meta[croot].complete:
+                done += 1
+            else:
+                open_n += 1
+        return min(0.9 * done + 0.35 * open_n, 2.2)
 
     def _potential(self, rep, my_idx: int) -> float:
         """未完成特征潜力：己方 ×0.25，最强对手 ×0.15。
@@ -495,7 +613,7 @@ class BotAI:
                     if s > best_s:
                         best_s, best_d = s, (KIND_MON, 0)
                     continue
-                if seg["mine"] > 0:
+                if seg["mine"] > 0 or seg["theirs"] > 0:
                     continue  # 己方已占，无法部署
                 completes, pts = seg["completes"], seg["points"]
                 if kind == KIND_CITY:
@@ -505,26 +623,33 @@ class BotAI:
                 elif kind == KIND_ROAD:
                     s = pts * 1.6 if completes else 0.8 + min(seg["n_tiles"], 4) * 0.3
                     if self.level == "hard" and seg["can_contest"]:
-                        s += 0.0
+                        s += 0.8  # 接入可赢的道路争夺（低于城市：收益小）
                 else:  # farm：终局投资，米宝充裕且毗邻城市才值得
                     s = 0.25
-                    if self.level == "hard" and seg["is_farm_adj"]                             and eng.current_player().meeples_left >= 5:
-                        s += 0.0
+                    if (self.level == "hard" and seg["is_farm_adj"]
+                            and eng.current_player().meeples_left >= 5):
+                        s += max((self._farm_bonus(eng, root) for root in seg["roots"]), default=0)
                 if s > best_s:
                     best_s, best_d = s, (kind, seg["idx"])
         return best_s, best_d
 
     def _best_deploy(self, eng: CarcassonneEngine, options) -> Optional[Dict[str, object]]:
         """deploy 阶段实际决策：从 options 中选最高估值。"""
-        info = self._prospects(eng, eng.placed_pos[0], eng.placed_pos[1],
-                               eng.board.tiles[eng.placed_pos].rot)
         my_color = eng.current_player().color
-        opp_colors = [p.color for p in eng.players if p.color != my_color]
         best_s, best_opt = 0.0, None
         for opt in options:
             kind, seg_idx = opt["kind"], opt["seg"]
+            if kind in ("shepherd", "crown"):
+                # 牧羊人/王冠位：价值依赖后续羊袋/轮盘事件，给保守权重。
+                # 此前这两种 kind 落入下方 info[kind] 分支直接 KeyError
+                # （山丘与羊/命运之轮 + AI 的对局必崩，verify_ai 不含该扩展故未暴露）。
+                s = 0.6 if kind == "shepherd" else 0.5
+                if best_s < s:
+                    best_s, best_opt = s, opt
+                continue
             if kind == "mayor":
-                s = 1.2   # 市长：0 旗不得分但占位无消耗（旗城强）
+                meta = eng.board.meta(opt["node"])
+                s = 1.2 if meta.pennants else 0.2
                 if best_s < s:
                     best_s, best_opt = s, opt
                 continue
@@ -554,30 +679,36 @@ class BotAI:
                     best_s, best_opt = s, opt
                 continue
             if kind == "princess":
+                if opt.get("victim_color") == my_color:
+                    continue
                 s = 3.0   # 移走对手骑士（削弱+节流）
                 if best_s < s:
                     best_s, best_opt = s, opt
                 continue
             if kind == KIND_MON:
-                n_adj = board_adjacent_count(eng, eng.placed_pos[0], eng.placed_pos[1])
+                node = opt["node"]
+                n_adj = board_adjacent_count(eng, node[0], node[1])
                 s = 8.0 if n_adj >= 6 else (6.0 if n_adj >= 5 else
                                             (3.5 if n_adj >= 4 else 0.6))
             else:
-                seg = info[kind][seg_idx]
+                node = opt["node"]
+                root = eng.board.find(node)
+                meta = eng.board._meta[root]
                 if kind == KIND_CITY:
-                    s = seg["points"] * 1.8 if seg["completes"] else \
-                        1.0 + min(seg["n_tiles"], 5) * 0.4
-                    if seg["theirs"] > 0 and self.level == "hard":
-                        s += 2.5
+                    s = eng._feature_pts(meta, root) * 1.8 if meta.complete else \
+                        1.0 + min(len(meta.tiles), 5) * 0.4
+                    if meta.cathedrals and not meta.complete:
+                        s *= 0.7
                 elif kind == KIND_ROAD:
-                    s = seg["points"] * 1.6 if seg["completes"] else \
-                        0.8 + min(seg["n_tiles"], 4) * 0.3
-                    if seg["theirs"] > 0 and self.level == "hard":
-                        s += 1.2
+                    s = eng._feature_pts(meta, root) * 1.6 if meta.complete else \
+                        0.8 + min(len(meta.tiles), 4) * 0.3
+                    if meta.inns and not meta.complete:
+                        s *= 0.7
                 else:
                     s = 0.25
-                    if self.level == "hard" and seg.get("is_farm_adj")                             and eng.current_player().meeples_left >= 5:
-                        s += 0.0
+                    if (self.level == "hard"
+                            and eng.current_player().meeples_left >= 5):
+                        s += self._farm_bonus(eng, node)
             if s > best_s:
                 best_s, best_opt = s, opt
         return best_opt
@@ -590,6 +721,8 @@ class _AggMeta:
         self.tiles = set(a.tiles) | set(b.tiles)
         self.pennants = a.pennants + b.pennants
         self.open_edges = a.open_edges + b.open_edges
+        self.inns = a.inns + b.inns
+        self.cathedrals = a.cathedrals + b.cathedrals
         self.meeples = dict(a.meeples)
         for c, n in b.meeples.items():
             self.meeples[c] = self.meeples.get(c, 0) + n

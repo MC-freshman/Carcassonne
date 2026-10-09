@@ -3,7 +3,8 @@
 
 - 牌面：按 tile_data 的拓扑定义程序化绘制（田野纹理/城墙垛口/角塔/旗帜/
   平滑道路/修道院/村庄广场），master 尺寸 168px
-- 米宝：站立小人（农夫为横躺），六色
+- 米宝：经典米宝剪影（农夫横躺），白描边 + 肚子印座位号，六色，
+  按显示尺寸 1:1 出图（4 倍超采样后缩放），普通 28px / 大型 40px
 - 计分板：双行 0–50 循环轨道（上行 0–25 左→右，下行 26–50 右→左）
 
 输出目录 assets/；UI 通过 SpriteStore 加载，缺失时自动生成。
@@ -14,9 +15,10 @@ import math
 import os
 import random
 import sys
+import zlib
 from typing import Dict, Optional, Tuple
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 from .models import Center, Terrain
 from . import tile_data
@@ -32,7 +34,9 @@ def _base_dir() -> str:
 ASSET_DIR = os.path.join(_base_dir(), "assets")
 TILE_DIR = os.path.join(ASSET_DIR, "tiles")
 MASTER = 168          # 牌面 master 尺寸
-MEEPLE_MASTER = 40    # 米宝 master 尺寸
+MEEPLE_PX = 28        # 普通米宝的显示尺寸：牌面 84px 的三分之一
+MEEPLE_BIG_PX = 40    # 大型米宝（I&C）
+MEEPLE_SS = 4         # 超采样倍数：按 4 倍绘制再缩回，边缘不带锯齿
 SCORE_W, SCORE_H = 500, 64
 
 # ---------------------------------------------------------------- 调色板
@@ -55,8 +59,23 @@ def _font(size: int):
         return ImageFont.load_default()
 
 
+def _bold_font(size: int):
+    """徽记在 28px 米宝上只有 9px，必须用粗体才不糊。"""
+    for name in ("msyhbd.ttc", "msyh.ttc", "arialbd.ttf", "arial.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
 def _shade(c: Tuple[int, int, int], k: float) -> Tuple[int, int, int]:
     return tuple(max(0, min(255, int(v * k))) for v in c)
+
+
+def _tile_seed(tile_id: str) -> int:
+    """用 crc32 而非内置 hash()：str 的 hash 每进程带随机盐，同一张牌每次重绘都不同。"""
+    return zlib.crc32(tile_id.encode("utf-8")) & 0xFFFF
 
 
 # ---------------------------------------------------------------- 几何工具
@@ -90,7 +109,7 @@ def render_tile(tile, rot: int = 0) -> Image.Image:
     s = MASTER
     img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    rng = random.Random(hash(tile.tile_id) & 0xFFFF)
+    rng = random.Random(_tile_seed(tile.tile_id))
 
     # ---- 田野底 + 噪点纹理
     d.rectangle([0, 0, s, s], fill=COL_FIELD)
@@ -489,35 +508,69 @@ def render_tile(tile, rot: int = 0) -> Image.Image:
 
 # ---------------------------------------------------------------- 米宝
 
-def render_meeple(color: str, farmer: bool = False) -> Image.Image:
+def _meeple_mask(S: int, farmer: bool) -> Image.Image:
+    """经典米宝剪影的 L 蒙版：圆头 + 张开的双臂 + 下沿开口的双腿，farmer 时整只横躺。"""
+    m = Image.new("L", (S, S), 0)
+    d = ImageDraw.Draw(m)
+
+    def q(x: float, y: float) -> Tuple[float, float]:
+        return (y * S, (1.0 - x) * S) if farmer else (x * S, y * S)
+
+    hr = 0.155 * S
+    hx, hy = q(0.5, 0.175)
+    d.ellipse([hx - hr, hy - hr, hx + hr, hy + hr], fill=255)
+    d.polygon([q(*p) for p in ((0.335, 0.30), (0.665, 0.30), (0.80, 0.955),
+                               (0.585, 0.955), (0.50, 0.66), (0.415, 0.955),
+                               (0.20, 0.955))], fill=255)
+    ar = 0.068 * S
+    for a, b in (((0.42, 0.40), (0.075, 0.545)),
+                 ((0.58, 0.40), (0.925, 0.545))):
+        ax, ay = q(*a)
+        bx, by = q(*b)
+        dx, dy = bx - ax, by - ay
+        ln = math.hypot(dx, dy) or 1.0
+        nx, ny = -dy / ln * ar, dx / ln * ar
+        d.polygon([(ax + nx, ay + ny), (bx + nx, by + ny),
+                   (bx - nx, by - ny), (ax - nx, ay - ny)], fill=255)
+        for cx, cy in ((ax, ay), (bx, by)):
+            d.ellipse([cx - ar, cy - ar, cx + ar, cy + ar], fill=255)
+    return m
+
+
+def meeple_badge(color: str) -> str:
+    """米宝/塔顶/隧道上印的座位号：汉字徽记在 9px 下"绿/黑"会糊，数字不会。"""
+    from .engine import PLAYER_COLORS
+    return str(PLAYER_COLORS.index(color) + 1) if color in PLAYER_COLORS else ""
+
+
+def render_meeple(color: str, farmer: bool = False,
+                  size: int = MEEPLE_PX) -> Image.Image:
     from .engine import COLOR_HEX
     hexv = COLOR_HEX.get(color, "#888888")
     base = tuple(int(hexv[i:i + 2], 16) for i in (1, 3, 5))
-    dark = _shade(base, 0.72)
-    s = MEEPLE_MASTER
-    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    cx, cy = s / 2, s * 0.56
-    # 阴影
-    d.ellipse([cx - 10, cy + 10, cx + 10, cy + 16], fill=(0, 0, 0, 70))
-    if farmer:
-        # 横躺的农夫
-        d.rounded_rectangle([cx - 15, cy - 6, cx + 15, cy + 6], radius=6,
-                            fill=base, outline=dark, width=2)
-        d.ellipse([cx - 15, cy - 10, cx - 4, cy + 1], fill=base, outline=dark, width=2)
-        d.rounded_rectangle([cx - 17, cy - 12, cx - 10, cy - 2], radius=3,
-                            fill=dark)
-    else:
-        # 站立随从：斗篷 + 头 + 帽
-        d.rounded_rectangle([cx - 8, cy - 8, cx + 8, cy + 12], radius=6,
-                            fill=base, outline=dark, width=2)
-        d.polygon([(cx - 10, cy - 2), (cx + 10, cy - 2), (cx, cy - 16)],
-                  fill=base, outline=dark, width=2)
-        d.ellipse([cx - 6, cy - 18, cx + 6, cy - 7], fill=base, outline=dark, width=2)
-        d.rectangle([cx - 8, cy - 19, cx + 8, cy - 15], fill=dark)
-    # 高光
-    d.ellipse([cx - 4, cy - 16, cx - 1, cy - 12], fill=(255, 255, 255, 120))
-    return img
+    dark = _shade(base, 0.55)
+    S = size * MEEPLE_SS
+    m = _meeple_mask(S, farmer)
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    # 白色外描边：草地/城墙/道路上都能把剪影脱出来
+    img.paste((255, 255, 255, 255), (0, 0),
+              m.filter(ImageFilter.MaxFilter(4 * MEEPLE_SS + 1)))
+    img.paste(base + (255,), (0, 0), m)
+    # 内沿收一道深色，避免纯色块看着像贴纸
+    img.paste(dark + (255,), (0, 0), ImageChops.subtract(
+        m, m.filter(ImageFilter.MinFilter(2 * MEEPLE_SS + 1))))
+    mark = meeple_badge(color)
+    if mark:
+        d = ImageDraw.Draw(img)
+        bx, by = (0.47 * S, 0.5 * S) if farmer else (0.5 * S, 0.47 * S)
+        d.text((bx, by), mark, font=_bold_font(int(S * 0.34)), anchor="mm",
+               fill=(255, 255, 255, 255), stroke_width=3,
+               stroke_fill=(20, 20, 20, 255))
+    return img.resize((size, size), Image.LANCZOS)
+
+
+def meeple_file(color: str, farmer: bool, big: bool) -> str:
+    return "%s_%s%s.png" % (color, "f" if farmer else "s", "_big" if big else "")
 
 
 # ---------------------------------------------------------------- 计分板
@@ -569,13 +622,19 @@ def score_pos(score: int, w: int = SCORE_W, h: int = SCORE_H) -> Tuple[float, fl
 
 # ---------------------------------------------------------------- 生成与加载
 
+def _png_size(path: str) -> Optional[Tuple[int, int]]:
+    try:
+        with Image.open(path) as im:
+            return im.size
+    except OSError:
+        return None
+
+
 def ensure_assets(force: bool = False) -> None:
     """生成全部素材 PNG（已存在且非 force 时跳过）。牌面含 4 个旋转方向。"""
     os.makedirs(TILE_DIR, exist_ok=True)
     need = []
-    tiles = tile_data.all_definitions(
-        ["inns", "traders", "pd", "abbey", "king", "river", "shrine", "bcb"])
-    tiles += [t for _c, _r, t in tile_data.CC_BLOCK]
+    tiles = tile_data.registered_definitions()
     for tile in tiles:
         for rot in range(4):
             p = os.path.join(TILE_DIR, "%s_r%d.png" % (tile.tile_id, rot))
@@ -589,9 +648,12 @@ def ensure_assets(force: bool = False) -> None:
     from .engine import PLAYER_COLORS
     for color in PLAYER_COLORS:
         for farmer in (False, True):
-            p = os.path.join(meeple_dir, "%s_%s.png" % (color, "f" if farmer else "s"))
-            if force or not os.path.exists(p):
-                render_meeple(color, farmer).save(p)
+            for big in (False, True):
+                px = MEEPLE_BIG_PX if big else MEEPLE_PX
+                p = os.path.join(meeple_dir, meeple_file(color, farmer, big))
+                # 尺寸不符也要重生成：贴图入过库，旧图会被静默复用
+                if force or _png_size(p) != (px, px):
+                    render_meeple(color, farmer, px).save(p)
     sb = os.path.join(ASSET_DIR, "scoreboard.png")
     if force or not os.path.exists(sb):
         render_scoreboard().save(sb)
@@ -606,7 +668,20 @@ class SpriteStore:
             ensure_assets()
             self._tiles: Dict[Tuple[str, int], object] = {}
             self._meeples: Dict[Tuple[str, bool], object] = {}
+            self._tiles_sized: Dict[Tuple[str, int, int], object] = {}
+            self._meeples_sized: Dict[Tuple[str, bool, bool, int], object] = {}
             self._sb: Optional[object] = None
+            from PIL import Image  # noqa: F401  高分屏精确缩放用
+            self._Image = Image
+            try:
+                self._resample = Image.Resampling.LANCZOS
+            except AttributeError:
+                self._resample = Image.LANCZOS
+            try:
+                from PIL import ImageTk
+                self._ImageTk = ImageTk
+            except Exception:
+                self._ImageTk = None
             self.ok = True
         except Exception:
             self.ok = False
@@ -621,14 +696,53 @@ class SpriteStore:
             self._tiles[key] = img
         return img
 
-    def meeple(self, color: str, farmer: bool) -> object:
-        key = (color, farmer)
+    def tile_sized(self, tile_id: str, rot: int, size: int) -> Optional[object]:
+        """按精确像素取牌面贴图（LANCZOS 缩放，高分屏 TILE 缩放用）。
+
+        PIL/ImageTk 不可用或文件缺失时返回 None，调用方回退 subsample。
+        """
+        if self._ImageTk is None:
+            return None
+        size = max(8, int(size))
+        key = (tile_id, rot, size)
+        img = self._tiles_sized.get(key)
+        if img is None:
+            path = os.path.join(TILE_DIR, "%s_r%d.png" % (tile_id, rot))
+            if not os.path.isfile(path):
+                return None
+            im = self._Image.open(path).convert("RGBA").resize(
+                (size, size), self._resample)
+            img = self._ImageTk.PhotoImage(im, master=self.root)
+            self._tiles_sized[key] = img
+        return img
+
+    def meeple(self, color: str, farmer: bool, big: bool = False) -> object:
+        key = (color, farmer, big)
         img = self._meeples.get(key)
         if img is None:
             from tkinter import PhotoImage
             img = PhotoImage(master=self.root, file=os.path.join(
-                ASSET_DIR, "meeples", "%s_%s.png" % (color, "f" if farmer else "s")))
+                ASSET_DIR, "meeples", meeple_file(color, farmer, big)))
             self._meeples[key] = img
+        return img
+
+    def meeple_sized(self, color: str, farmer: bool, big: bool,
+                     size: int) -> Optional[object]:
+        """按精确像素取米宝贴图（高分屏下与 TILE 同步缩放）。"""
+        if self._ImageTk is None:
+            return None
+        size = max(8, int(size))
+        key = (color, farmer, big, size)
+        img = self._meeples_sized.get(key)
+        if img is None:
+            path = os.path.join(ASSET_DIR, "meeples",
+                                meeple_file(color, farmer, big))
+            if not os.path.isfile(path):
+                return None
+            im = self._Image.open(path).convert("RGBA").resize(
+                (size, size), self._resample)
+            img = self._ImageTk.PhotoImage(im, master=self.root)
+            self._meeples_sized[key] = img
         return img
 
     def scoreboard(self) -> object:

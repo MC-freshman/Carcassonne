@@ -102,6 +102,30 @@ class Board:
         self.bridges: Dict[Tuple[int, int], int] = {}
         # M20 隧道：隧道口路段节点 -> 占领色名（同色第二枚令牌接通两条路）
         self.tunnel_tokens: Dict[Node, str] = {}
+        self.frontier: Set[Tuple[int, int]] = set()
+
+    def clone(self) -> "Board":
+        """复制可变规则状态，复用不可变牌定义和节点；保留元数据别名。"""
+        rep = Board()
+        rep.tiles = self.tiles.copy()
+        rep.defs = self.defs.copy()
+        rep._parent = self._parent.copy()
+        metas = {}
+        for node, meta in self._meta.items():
+            if id(meta) not in metas:
+                cloned = FeatureMeta.__new__(FeatureMeta)
+                for name in FeatureMeta.__slots__:
+                    value = getattr(meta, name)
+                    setattr(cloned, name, value.copy() if isinstance(value, (dict, list, set)) else value)
+                cloned.figure_nodes = {key: list(nodes)
+                                       for key, nodes in meta.figure_nodes.items()}
+                metas[id(meta)] = cloned
+            rep._meta[node] = metas[id(meta)]
+        rep.farm_city_pairs = self.farm_city_pairs.copy()
+        rep.bridges = self.bridges.copy()
+        rep.tunnel_tokens = self.tunnel_tokens.copy()
+        rep.frontier = self.frontier.copy()
+        return rep
 
     # ------------------------------------------------------------ 基础查询
 
@@ -232,6 +256,11 @@ class Board:
         x, y = tile.x, tile.y
         self.tiles[(x, y)] = tile
         self.defs[(x, y)] = defn
+        self.frontier.discard((x, y))
+        for dx, dy in EDGE_DELTAS.values():
+            pos = (x + dx, y + dy)
+            if pos not in self.tiles:
+                self.frontier.add(pos)
         rot = tile.rot
 
         # 1) 建节点并处理边匹配

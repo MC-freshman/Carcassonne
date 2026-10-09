@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import random
+from copy import deepcopy
 from typing import Dict, List, Optional, Set, Tuple
 
 from .board import Board, KIND_CITY, KIND_FARM, KIND_MON, KIND_ROAD, Node
@@ -203,6 +204,9 @@ class CarcassonneEngine:
     # ------------------------------------------------------------ 内部工具
 
     def _draw_tile(self) -> None:
+        if getattr(self, "_simulation_stop_before_draw", False) and (self.deck or self.river_pile):
+            self.current_tile = None
+            return
         self.current_tile = None
         # M18 河流阶段：从河流序列摸牌（岔流→洗匀→火山湖收尾）
         if self.phase == "river" and self.river_pile:
@@ -243,6 +247,47 @@ class CarcassonneEngine:
     def current_player(self) -> Player:
         return self.players[self.turn_idx]
 
+    def decision_player(self) -> Optional[Player]:
+        """当前阶段实际行动者，特殊阶段不一定是放牌玩家。"""
+        if self.game_over:
+            return None
+        idx = self.turn_idx
+        if self.phase == "dragon":
+            return self.dragon_decider_player()
+        if self.phase == "redeploy":
+            st = self.redeploy_state()
+            return self.players[st["player"]] if st else None
+        if self.phase == "count_deploy":
+            idx = self._placer_idx
+        elif self.phase == "castle" and self._castle_queue:
+            meta = self.board.meta(self._castle_queue[0])
+            winners, _ = self._city_majority(meta)
+            return self._player_by_color(winners[0]) if winners else self.current_player()
+        elif self.phase == "bazaar" and self.bazaar:
+            idx = (self.bazaar.get("bid_turn") if self.bazaar["phase"] == "bid"
+                   else self.bazaar["selector"])
+        elif self.phase == "crop" and self.crop:
+            idx = (self._placer_idx if self.crop["mode"] is None else
+                   self.crop["order"][self.crop["pos"]])
+        elif self.phase == "robber" and self.robber_phase:
+            idx = self.robber_phase["order"][self.robber_phase["pos"]]
+        elif self.phase == "plague" and self.plague:
+            idx = self.plague["order"][self.plague["pos"]]
+        return self.players[idx] if idx is not None else None
+
+    def clone_for_simulation(self) -> "CarcassonneEngine":
+        """完整规则副本，直接复制并查集，不经丢失规则状态的显示快照重建。"""
+        rep = self.__class__.__new__(self.__class__)
+        memo = {id(self.board): self.board.clone()}
+        for tile in list(self.board.defs.values()) + self.deck + self.river_pile + self._aside_tiles:
+            memo[id(tile)] = tile
+        if self.current_tile is not None:
+            memo[id(self.current_tile)] = self.current_tile
+        memo[id(self.log_lines)] = list(self.log_lines)
+        memo[id(self.events)] = list(self.events)
+        rep.__dict__ = deepcopy(self.__dict__, memo)
+        return rep
+
     def tiles_left(self) -> int:
         return (len(self.deck) + len(self.river_pile)
                 + (1 if self.phase in ("place", "river") and self.current_tile
@@ -255,14 +300,15 @@ class CarcassonneEngine:
         tile = self.current_tile
         if tile is None or self.phase not in ("place", "river"):
             return []
+        key = (tile, self.phase, self.turn_idx, len(self.board.tiles),
+               tuple(sorted(self.board.bridges.items())), self.current_player().bridges_left,
+               self._river_on)
+        cached = getattr(self, "_legal_cache", None)
+        if cached and cached[0] == key:
+            self._needed_bridge = dict(cached[2])
+            return list(cached[1])
         self._needed_bridge = {}
-        cells: Set[Tuple[int, int]] = set()
-        for x, y in list(self.board.tiles):
-            for side in range(4):
-                dx, dy = EDGE_DELTAS[side]
-                npos = (x + dx, y + dy)
-                if not self.board.has(*npos):
-                    cells.add(npos)
+        cells = self.board.frontier
         out: List[Tuple[int, int, int]] = []
         for nx, ny in sorted(cells):
             # S&H：教堂不得邻接 ≥2 修道院；修道院/修道院牌不得邻接 ≥2 教堂
@@ -284,6 +330,7 @@ class CarcassonneEngine:
                     if fix is not None:
                         out.append((nx, ny, rot))
                         self._needed_bridge[(nx, ny, rot)] = fix
+        self._legal_cache = (key, tuple(out), dict(self._needed_bridge))
         return out
 
     def _shrine_place_ok(self, tile: TileDef, x: int, y: int) -> bool:
@@ -483,7 +530,8 @@ class CarcassonneEngine:
                 node = (x, y, KIND_FARM, i)
                 root = self.board.find(node)
                 for sh in self.shepherds:
-                    if sh["color"] == player.color                             and self.board.find(sh["node"]) == root:
+                    if (sh["color"] == player.color
+                            and self.board.find(sh["node"]) == root):
                         self._shepherd_pending.append(root)
                         break
 
@@ -535,7 +583,11 @@ class CarcassonneEngine:
 
     def shepherd_options(self) -> List[Dict[str, object]]:
         """牧羊人部署选项：刚放牌上无其他牧羊人的草场段（幽灵步骤除外）。"""
-        if self.phase != "deploy" or self.placed_pos is None                 or self.current_tile is None                 or self._phantom_step                 or self.current_player().shepherd_left <= 0                 or "hillsheep" not in self.expansions:
+        if (self.phase != "deploy" or self.placed_pos is None
+                or self.current_tile is None
+                or self._phantom_step
+                or self.current_player().shepherd_left <= 0
+                or "hillsheep" not in self.expansions):
             return []
         x, y = self.placed_pos
         tile = self.current_tile
@@ -628,11 +680,32 @@ class CarcassonneEngine:
         self._after_deploy()
 
     def deploy_options(self) -> List[Dict[str, object]]:
+        options = self._deploy_options()
+        player = self.current_player()
+        variants = {(o.get("node"), bool(o.get("big"))) for o in options}
+        # 传送门也同时提供普通/大型供给，幽灵步骤仅使用普通形态。
+        for opt in list(options):
+            if opt.get("pos") and opt["kind"] in (KIND_CITY, KIND_ROAD, KIND_FARM, KIND_MON):
+                opposite = dict(opt, big=not opt.get("big"))
+                key = (opposite.get("node"), bool(opposite.get("big")))
+                if key not in variants:
+                    options.append(opposite)
+                    variants.add(key)
+        if self._phantom_step:
+            return [dict(o, big=False, phantom=True) for o in options
+                    if o["kind"] in (KIND_CITY, KIND_ROAD, KIND_FARM, KIND_MON)
+                    and not o.get("big") and player.phantom_left > 0]
+        return [o for o in options if o["kind"] not in
+                (KIND_CITY, KIND_ROAD, KIND_FARM, KIND_MON) or
+                (player.big_meeples_left > 0 if o.get("big") else player.meeples_left > 0)]
+
+    def _deploy_options(self) -> List[Dict[str, object]]:
         """本回合刚放牌上可部署的段列表（特征上无任何米宝）。"""
         if self.phase != "deploy" or self.placed_pos is None or self.current_tile is None:
             return []
         player = self.current_player()
-        if player.meeples_left <= 0 and player.big_meeples_left <= 0:
+        if (player.meeples_left <= 0 and player.big_meeples_left <= 0
+                and not self._phantom_step):
             return self.shepherd_options()   # 无随从仍可部署牧羊人
         x, y = self.placed_pos
         tile = self.current_tile
@@ -742,6 +815,14 @@ class CarcassonneEngine:
                                         "node": node, "big": False, "fig": "pig"})
         return options
 
+    def deploy_option(self, opt: Dict[str, object]) -> None:
+        """UI/AI 共用完整选项，保留传送门、大小、幽灵、公主目标参数。"""
+        assert opt in self.deploy_options(), "部署选项已失效"
+        self.deploy(opt["kind"], opt["seg"], big=bool(opt.get("big")),
+                    pos=opt.get("pos"), victim=opt.get("victim"),
+                    victim_color=opt.get("victim_color"),
+                    phantom=bool(opt.get("phantom")))
+
     def deploy(self, kind: str, seg: int, big: bool = False,
                pos: Optional[Tuple[int, int]] = None,
                victim: Optional[Node] = None,
@@ -749,14 +830,20 @@ class CarcassonneEngine:
                phantom: bool = False) -> None:
         """通用部署入口：普通米宝直达，图元/仙女/公主路由到专用方法。"""
         assert self.phase == "deploy"
+        if self._phantom_step:
+            phantom = True
         if phantom:
             # M20 幽灵：第二随从（或本回合唯一随从），目标特征须无人占据
             assert self._phantom_step, "当前不是幽灵部署步骤"
             assert kind in (KIND_CITY, KIND_ROAD, KIND_FARM, KIND_MON), \
                 "幽灵只能部署为普通随从"
             player = self.current_player()
+            assert player.phantom_left > 0, "没有可用幽灵"
             base = tuple(pos) if pos else self.placed_pos
             node = (base[0], base[1], kind, seg)
+            assert any(o["kind"] == kind and o["seg"] == seg
+                       and (o.get("pos") or self.placed_pos) == base
+                       for o in self.deploy_options()), "非法幽灵部署"
             assert not self.board.meta(node).meeples, "目标特征已有米宝"
             self.board.deploy_meeple(node, player.color, 1, phantom=True)
             player.phantom_left -= 1
@@ -810,6 +897,7 @@ class CarcassonneEngine:
                 return self.deploy_builder(real, seg)
             return self.deploy_pig(KIND_FARM, seg)
         player = self.current_player()
+        assert (player.big_meeples_left if big else player.meeples_left) > 0, "没有可用随从"
         base = tuple(pos) if pos else self.placed_pos
         node = (base[0], base[1], kind, seg)
         self.board.deploy_meeple(node, player.color, size=2 if big else 1)
@@ -903,7 +991,8 @@ class CarcassonneEngine:
                 options.append({"kind": KIND_FARM, "seg": i, "pos": pos,
                                 "label": "传送门·农夫 (%d,%d)" % pos,
                                 "node": node, "big": False})
-            if d.center.value == 1 and not self.board.monastery_complete(pos):
+            if (d.center.value == 1 and not self.board.monastery_complete(pos)
+                    and not self.board.meta((pos[0], pos[1], KIND_MON, 0)).meeples):
                 options.append({"kind": KIND_MON, "seg": 0, "pos": pos,
                                 "label": "传送门·僧侣 (%d,%d)" % pos,
                                 "node": node, "big": False})
@@ -975,7 +1064,7 @@ class CarcassonneEngine:
                     p = self._player_by_color(color)
                     if node in meta.phantoms:
                         p.phantom_left += 1
-                        meta.phantoms.discard(node)
+                        meta.phantoms.remove(node)
                     elif size == 2:
                         p.big_meeples_left += 1
                     else:
@@ -2125,10 +2214,12 @@ class CarcassonneEngine:
         assert self.phase == "escape"
         if node is not None:
             assert node in self._siege_escape_nodes(), "非法脱困"
-            color, _size, ph = self.board.remove_meeple(tuple(node))
+            color, size, ph = self.board.remove_meeple(tuple(node))
             p = self._player_by_color(color)
             if ph:
                 p.phantom_left += 1
+            elif size == 2:
+                p.big_meeples_left += 1
             else:
                 p.meeples_left += 1
             self._log("🏃 %s 的骑士从被围城逃出 (%d,%d)#%d"
@@ -2147,9 +2238,12 @@ class CarcassonneEngine:
                 or self._phantom_done:
             return False
         player = self.current_player()
-        if player.phantom_left <= 0 or not self.deploy_options():
+        if player.phantom_left <= 0:
             return False
         self._phantom_step = True
+        if not self.deploy_options():
+            self._phantom_step = False
+            return False
         self._phantom_done = True
         self.phase = "deploy"
         self._log("👻 %s 可部署幽灵（第二随从）" % player.name)
@@ -2394,7 +2488,8 @@ class CarcassonneEngine:
             changed = False
             for i, h1 in enumerate(self.hostages):
                 for j, h2 in enumerate(self.hostages):
-                    if i != j and h1["owner"] == h2["captor"]                             and h2["owner"] == h1["captor"]:
+                    if (i != j and h1["owner"] == h2["captor"]
+                            and h2["owner"] == h1["captor"]):
                         for h in (h1, h2):
                             p = self._player_by_color(h["owner"])
                             if h.get("ph"):
@@ -2635,15 +2730,18 @@ class CarcassonneEngine:
         ph_nodes = self.board.pop_phantoms(root)
         owner_figs: List[str] = []
         for color, size, nd in taken:
+            is_phantom = nd in ph_nodes
+            if is_phantom:
+                ph_nodes.remove(nd)
             if color != owner:
                 pl = self._player_by_color(color)
-                if nd in ph_nodes:
+                if is_phantom:
                     pl.phantom_left += 1
                 elif size == 2:
                     pl.big_meeples_left += 1
                 else:
                     pl.meeples_left += 1
-            elif nd in ph_nodes:
+            elif is_phantom:
                 owner_figs.append("phantom")
             else:
                 owner_figs.append("big" if size == 2 else "meeple")
@@ -3246,10 +3344,14 @@ class CarcassonneEngine:
         figures = []
         for root in self.board.roots():
             meta = self.board._meta[root]
+            ph_nodes = list(meta.phantoms)
             for node, color, size in meta.meeple_nodes:
+                is_phantom = node in ph_nodes
+                if is_phantom:
+                    ph_nodes.remove(node)
                 meeples.append({"x": node[0], "y": node[1], "kind": node[2],
                                 "seg": node[3], "color": color, "size": size,
-                                "ph": node in meta.phantoms})
+                                "ph": is_phantom})
             for node, color in self._iter_figure_nodes(root, "builders"):
                 figures.append({"x": node[0], "y": node[1], "kind": node[2],
                                 "seg": node[3], "color": color, "fig": "builder"})
@@ -3558,13 +3660,15 @@ class CarcassonneEngine:
             eng.placed_pos = None
         # 牧羊行动阶段：重建待行动草场
         eng._shepherd_pending = []
-        if eng.phase == "shepherd" and "hillsheep" in eng.expansions                 and eng.current_tile is not None and eng.placed_pos:
+        if (eng.phase == "shepherd" and "hillsheep" in eng.expansions
+                and eng.current_tile is not None and eng.placed_pos):
             from .board import KIND_FARM as _KF
             for i in range(len(eng.current_tile.farms)):
                 node = (eng.placed_pos[0], eng.placed_pos[1], _KF, i)
                 root = eng.board.find(node)
                 for s in eng.shepherds:
-                    if s["color"] == eng.players[eng.turn_idx].color                             and eng.board.find(s["node"]) == root:
+                    if (s["color"] == eng.players[eng.turn_idx].color
+                            and eng.board.find(s["node"]) == root):
                         eng._shepherd_pending.append(root)
                         break
         return eng

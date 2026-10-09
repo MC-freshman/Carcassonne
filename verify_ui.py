@@ -101,6 +101,7 @@ def run() -> bool:
     app.update_idletasks()
     app.update()
     app.after = lambda ms, fn, *a, **k: None  # 测试禁用定时调度，避免幽灵推进
+    app._ai_async = False
 
     # 控件存在性
     assert app.btn_rot.winfo_exists(), "旋转按钮缺失"

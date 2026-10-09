@@ -9,11 +9,17 @@
 from __future__ import annotations
 
 import os
+import copy
+import json
 import queue
+import random
 import re
 import socket
+import time
+import threading
+import traceback
 import tkinter as tk
-from tkinter import font as tkfont, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 from typing import Dict, List, Optional, Tuple
 
 from . import art, tile_data
@@ -21,6 +27,7 @@ from .board import KIND_CITY, KIND_FARM, KIND_MON, KIND_ROAD
 from .bot_ai import BotAI
 from .engine import COLOR_HEX, CarcassonneEngine
 from .models import TileDef, meeple_majority
+from . import recorder, ai_turn
 
 
 # M14 拆分：常量与绘制在 ui_common，对话框在 ui_dialogs（保持公开名字）
@@ -28,9 +35,11 @@ from .ui_common import (  # noqa: F401
     TILE, PREVIEW, GRID_ORIGIN, FONT, FONT_S, FONT_L,
     COL_FIELD, COL_FIELD_DARK, COL_CITY, COL_CITY_WALL, COL_ROAD,
     COL_ROAD_BORDER, COL_MON, COL_BG, COL_HILITE, EDGE_MID,
+    DPI_SCALE, MEEPLE_PX, MEEPLE_BIG_PX,
     _pull, seg_anchor, draw_tile, draw_meeple,
 )
 from .ui_dialogs import setup_dialog, mode_dialog, get_lan_ip  # noqa: F401
+from . import sound
 
 class App(tk.Tk):
     def __init__(self, specs: Optional[List[dict]] = None,
@@ -39,7 +48,8 @@ class App(tk.Tk):
                  server: Optional[object] = None,
                  net_info: str = "",
                  poll_ms: int = 100,
-                 expansions: Optional[list] = None):
+                 expansions: Optional[list] = None,
+                 replay_ops: Optional[List[dict]] = None):
         super().__init__()
         self.title("卡卡颂 · 桌游模拟器" + ("（联机）" if net else ""))
         self.configure(bg=COL_BG)
@@ -58,10 +68,20 @@ class App(tk.Tk):
         self.engine: Optional[CarcassonneEngine] = None
         self.expansions = list(expansions or [])
         if not self.net_mode:
-            self.engine = CarcassonneEngine(specs, seed=seed,
-                                            expansions=self.expansions)
-            self.bots = {i: BotAI(p.ai_level, seed=(seed or 0) + i)
-                         for i, p in enumerate(self.engine.players) if p.is_ai}
+            # 存档续局要求抽牌序列可复现：种子必须显式（本地局此前
+            # 传 None → random.Random(None)，同一存档无法重放）。
+            if seed is None:
+                seed = random.randrange(1 << 30)
+            self.seed = seed
+            eng = CarcassonneEngine(specs, seed=seed,
+                                    expansions=self.expansions)
+            if replay_ops:
+                recorder.apply_history(eng, replay_ops)
+            self.bots = {i: BotAI(p.ai_level, seed=seed + i)
+                         for i, p in enumerate(eng.players) if p.is_ai}
+            self.engine = recorder.RecordingProxy(eng)
+        else:
+            self.seed = None
         self.rot = 0
         self.hover_cell: Optional[Tuple[int, int]] = None
         self._logged_ev_idx = 0
@@ -69,6 +89,18 @@ class App(tk.Tk):
         self._finished = False
         self._flash_pos: Optional[Tuple[int, int]] = None
         self._img_cache: Dict[Tuple[str, int], object] = {}
+        self._pl_cache: Optional[Tuple[tuple, list]] = None
+        self._ai_async = True
+        self._ai_generation = 0
+        self._ai_job = None
+        self._ai_after_id = None
+        self._ai_paused = False
+        self._ai_single_step = False
+        self._ai_error = None
+        self._ai_last_stats = {}
+        self._ai_delay = tk.IntVar(master=self, value=420)
+        self._ai_budget = tk.IntVar(master=self, value=500)
+        self._ai_follow = tk.BooleanVar(master=self, value=False)
         self._build()
         self.sprites = art.SpriteStore(self)
         self._restore_window()
@@ -82,8 +114,38 @@ class App(tk.Tk):
     # ------------------------------------------------------------ 布局
 
     def _build(self) -> None:
-        self.geometry("1180x780+60+40")
-        self.minsize(980, 640)
+        self.geometry("%dx%d+60+40" % (int(1180 * DPI_SCALE),
+                                       int(780 * DPI_SCALE)))
+        self.minsize(int(980 * DPI_SCALE), int(640 * DPI_SCALE))
+
+        # 菜单：文件（本地存档）+ 选项（音效开关）
+        menubar = tk.Menu(self)
+        if not self.net_mode:
+            m_file = tk.Menu(menubar, tearoff=0)
+            m_file.add_command(label="另存为…", accelerator="Ctrl+S",
+                               command=self._save_game_as)
+            m_file.add_command(label="读取存档…", command=self._load_game)
+            menubar.add_cascade(label="文件", menu=m_file)
+            self.bind("<Control-s>", lambda e: self._save_game_as())
+            self.bind("<Control-S>", lambda e: self._save_game_as())
+        m_opts = tk.Menu(menubar, tearoff=0)
+        self._sound_on = tk.BooleanVar(value=True)
+        m_opts.add_checkbutton(label="音效效果", variable=self._sound_on,
+                               command=self._apply_sound_pref)
+        menubar.add_cascade(label="选项", menu=m_opts)
+        if not self.net_mode:
+            m_ai = tk.Menu(menubar, tearoff=0)
+            m_speed = tk.Menu(m_ai, tearoff=0)
+            for label, delay in (("最快", 0), ("快速", 100), ("正常", 420), ("慢速", 900)):
+                m_speed.add_radiobutton(label=label, variable=self._ai_delay, value=delay)
+            m_ai.add_cascade(label="播放速度", menu=m_speed)
+            m_budget = tk.Menu(m_ai, tearoff=0)
+            for label, budget in (("快速思考", 100), ("标准思考", 500), ("充分思考", 1500)):
+                m_budget.add_radiobutton(label=label, variable=self._ai_budget, value=budget)
+            m_ai.add_cascade(label="思考时间", menu=m_budget)
+            m_ai.add_checkbutton(label="跟随 AI 落牌", variable=self._ai_follow)
+            menubar.add_cascade(label="AI 观战", menu=m_ai)
+        self.configure(menu=menubar)
 
         top = tk.Frame(self, bg="#39422e", height=44)
         top.pack(fill="x")
@@ -94,6 +156,10 @@ class App(tk.Tk):
         self.lbl_left = tk.Label(top, text="", font=FONT, bg="#39422e",
                                  fg="#cfc49f")
         self.lbl_left.pack(side="left", padx=8)
+        if not self.net_mode:
+            self.btn_ai_pause = tk.Button(top, text="暂停 AI", command=self._toggle_ai_pause)
+            self.btn_ai_pause.pack(side="left", padx=4)
+            tk.Button(top, text="单步", command=self._single_ai_step).pack(side="left", padx=4)
         self.lbl_phase = tk.Label(top, text="", font=FONT, bg="#39422e",
                                   fg="#e8c96a")
         self.lbl_phase.pack(side="right", padx=14)
@@ -220,6 +286,24 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ 坐标
 
+    def _placements(self) -> list:
+        """当前牌合法放置缓存：同状态下 refresh/_draw_board 只算一次。
+
+        键覆盖影响 legal_placements 的全部引擎状态（阶段/当前牌/盘面规模/
+        木桥数/回合方/剩余牌数）。引擎状态只在动作后变化，而动作路径
+        最终都会走 refresh() 重算，因此跨 on_motion 的悬停重绘是安全的。
+        """
+        eng = self.engine
+        if eng is None or eng.phase not in ("place", "river"):
+            return []
+        key = (eng.phase, id(eng.current_tile), len(eng.board.tiles),
+               len(eng.board.bridges), eng.turn_idx, eng.tiles_left())
+        if self._pl_cache is not None and self._pl_cache[0] == key:
+            return self._pl_cache[1]
+        placements = eng.legal_placements()
+        self._pl_cache = (key, placements)
+        return placements
+
     _WIN_CFG = os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "assets", "window.cfg")
 
@@ -235,6 +319,7 @@ class App(tk.Tk):
 
     def _on_close(self) -> None:
         """关闭：保存窗口几何并退出（含联机资源清理）。"""
+        self._prompt_save_on_close()
         try:
             with open(self._WIN_CFG, "w", encoding="utf-8") as f:
                 f.write(self.geometry())
@@ -245,6 +330,87 @@ class App(tk.Tk):
         if self.net:
             self.net.close()
         self.destroy()
+
+    def destroy(self):
+        if hasattr(self, "_ai_generation"):
+            self._cancel_ai()
+        super().destroy()
+
+    # ------------------------------------------------------------ 存档
+
+    def _apply_sound_pref(self) -> None:
+        sound.enabled = bool(self._sound_on.get())
+
+    def _prompt_save_on_close(self) -> None:
+        """关窗前对未结束的本地对局询问是否保存（存档取消仍继续退出）。"""
+        if os.environ.get("CARCASSONNE_HEADLESS"):
+            return
+        eng = self.engine
+        if (self.net_mode or eng is None or eng.game_over
+                or not getattr(eng, "history", None)):
+            return
+        if messagebox.askyesno("退出", "对局尚未结束，保存进度再退出？",
+                               parent=self):
+            self._save_game_as()
+
+    def _save_game_as(self) -> None:
+        eng = self.engine
+        if self.net_mode or eng is None:
+            return
+        if eng.game_over:
+            self._flash("对局已结束，无需保存")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=recorder.SAVE_SUFFIX,
+            initialdir=recorder.saves_dir(),
+            initialfile="卡卡颂_%s%s" % (time.strftime("%m%d-%H%M"),
+                                         recorder.SAVE_SUFFIX),
+            filetypes=[("卡卡颂存档", "*.cksave"), ("所有文件", "*.*")],
+            parent=self)
+        if not path:
+            return
+        try:
+            recorder.save_to_file(
+                path, recorder.build_save(eng, self.seed, eng.history))
+        except OSError as exc:
+            messagebox.showerror("保存失败", str(exc), parent=self)
+            return
+        self._flash("已保存：%s" % os.path.basename(path))
+
+    def _load_game(self) -> None:
+        """读取存档并开新窗口续局（当前未结束对局先确认放弃）。"""
+        if self.net_mode:
+            return
+        path = filedialog.askopenfilename(
+            initialdir=recorder.saves_dir(),
+            filetypes=[("卡卡颂存档", "*.cksave"), ("所有文件", "*.*")],
+            parent=self)
+        if not path:
+            return
+        try:
+            data = recorder.load_save(path)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("读取失败", str(exc), parent=self)
+            return
+        eng = self.engine
+        if (eng is not None and not eng.game_over
+                and getattr(eng, "history", None)
+                and not os.environ.get("CARCASSONNE_HEADLESS")):
+            if not messagebox.askyesno("读取存档", "当前对局将被放弃，确定继续？",
+                                       parent=self):
+                return
+        # 几何/清理沿用当前窗口的收尾；新窗口接管主循环后旧循环退出
+        geo = self.geometry()
+        try:
+            with open(self._WIN_CFG, "w", encoding="utf-8") as f:
+                f.write(geo)
+        except OSError:
+            pass
+        app = App(data["players"], seed=data["seed"],
+                  expansions=data["expansions"], replay_ops=data["ops"])
+        app.geometry(geo)
+        self.destroy()
+        app.mainloop()
 
     def _origin(self) -> Tuple[int, int]:
         """网格 (0,0) 的画布坐标：固定常量。
@@ -276,14 +442,17 @@ class App(tk.Tk):
         self.canvas.yview_moveto(fy)
 
     def _tile_img(self, tile_id: str, rot: int, size: int):
-        """取牌面贴图（整数缩放，缓存）。"""
-        scale = max(1, art.MASTER // max(size, 8))
-        key = (tile_id, rot, scale)
+        """取牌面贴图：优先按精确像素缩放（高分屏），否则整数 subsample。"""
+        size = max(8, int(size))
+        key = (tile_id, rot, size)
         img = self._img_cache.get(key)
         if img is None:
-            img = self.sprites.tile(tile_id, rot)
-            if scale > 1:
-                img = img.subsample(scale)
+            img = self.sprites.tile_sized(tile_id, rot, size)
+            if img is None:
+                img = self.sprites.tile(tile_id, rot)
+                scale = max(1, art.MASTER // size)
+                if scale > 1:
+                    img = img.subsample(scale)
             self._img_cache[key] = img
         return img
 
@@ -293,7 +462,11 @@ class App(tk.Tk):
         if not self.sprites.ok:
             draw_tile(cv, tile, rot, px, py, size, tags)
             return
-        img = self._tile_img(tile.tile_id, rot, int(size))
+        try:
+            img = self._tile_img(tile.tile_id, rot, int(size))
+        except (OSError, tk.TclError):
+            draw_tile(cv, tile, rot, px, py, size, tags)
+            return
         cv.create_image(px + size / 2, py + size / 2, image=img, tags=tags)
         if ghost:
             cv.create_rectangle(px, py, px + size, py + size, fill="white",
@@ -305,14 +478,10 @@ class App(tk.Tk):
         if not self.sprites.ok:
             draw_meeple(cv, px, py, TILE, color, farmer)
             return
-        scale = 1 if big else 2   # 大型米宝全尺寸显示
-        key = (color, farmer, scale)
-        img = self._img_cache.get(key)
+        target = MEEPLE_BIG_PX if big else MEEPLE_PX
+        img = self.sprites.meeple_sized(color, farmer, big, target)
         if img is None:
-            img = self.sprites.meeple(color, farmer)
-            if scale > 1:
-                img = img.subsample(scale)
-            self._img_cache[key] = img
+            img = self.sprites.meeple(color, farmer, big)
         cv.create_image(px, py, image=img)
 
     def _flash_placed(self, x: int, y: int) -> None:
@@ -388,8 +557,10 @@ class App(tk.Tk):
         if self.engine is None or self.engine.game_over:
             return False
         if self.net_mode:
-            return self.engine.turn_idx == self.my_seat
-        return not self.engine.current_player().is_ai
+            player = self.engine.decision_player()
+            return player is not None and player.idx == self.my_seat
+        player = self.engine.decision_player()
+        return player is not None and not player.is_ai
 
     def _ping_loop(self) -> None:
         """联机：周期 ping 测往返延迟。"""
@@ -476,6 +647,7 @@ class App(tk.Tk):
             last = list(self.engine.board.tiles.values())[-1]
             self._flash_pos = (last.x, last.y)
             self._clear_flash_later()
+            sound.play("place")
         self._prev_tile_count = n
         self.btn_start.pack_forget()
         self._float_scores(list(msg.get("events") or []))
@@ -558,6 +730,12 @@ class App(tk.Tk):
                 self.net.send_discard()
             return
         if self.engine.phase == "place" and not self.engine.can_place_anywhere():
+            # 规则上弃牌需全员同意（CAR 基础规则），防误触加确认
+            if (not os.environ.get("CARCASSONNE_HEADLESS")
+                    and not messagebox.askyesno(
+                        "弃牌重抽", "规则上弃牌重抽需全员同意，确定弃掉「%s」？"
+                        % self.engine.current_tile.tile_id, parent=self)):
+                return
             self.engine.discard_and_redraw()
             self.rot = 0
             self.refresh()
@@ -601,9 +779,11 @@ class App(tk.Tk):
                     self.hover_cell = None
                     self.refresh()
                     self._flash_placed(x, y)
+                    sound.play("place")
                     self.maybe_ai_turn()
             else:
                 self._flash("此处不能放置（边不匹配）")
+                sound.play("bad")
         elif eng.phase == "deploy":
             # 点击部署锚点（事件坐标同样需转画布坐标）
             opts = eng.deploy_options()
@@ -631,16 +811,7 @@ class App(tk.Tk):
                                  victim_color=opt.get("victim_color"))
             return
         eng = self.engine
-        kind = opt["kind"]
-        if kind == "fairy":
-            eng.deploy_fairy(tuple(opt["pos"]))
-        elif kind == "princess":
-            eng.deploy_princess(tuple(opt["victim"]), opt["victim_color"])
-        else:
-            eng.deploy(kind, opt["seg"], big=bool(opt.get("big")),
-                       pos=opt.get("pos"),
-                       phantom=bool(eng._phantom_step)
-                       and kind in ("city", "road", "farm", "mon"))
+        eng.deploy_option(opt)
         self._emit_events()
         self.refresh()
         self.maybe_ai_turn()
@@ -1193,6 +1364,8 @@ class App(tk.Tk):
         evs = self.engine.events[self._logged_ev_idx:]
         self._logged_ev_idx = len(self.engine.events)
         self._float_scores(evs)
+        if evs:
+            sound.play("score")
         for ev in evs:
             self._log("🏅 %s：%s" % (ev.detail or ev.reason,
                                     "，".join("%s+%d" % (c, p)
@@ -1207,287 +1380,215 @@ class App(tk.Tk):
     # ------------------------------------------------------------ AI
 
     def maybe_ai_turn(self) -> None:
-        if self.net_mode:
+        if self.net_mode or self.engine is None:
             return
         if self.engine.game_over:
             self._finish()
             return
-        # P&D：龙阶段的 AI 决策者
-        if ("pd" in self.engine.expansions
-                and self.engine.phase == "dragon"):
-            dec = self.engine.dragon_decider_player()
-            if dec is not None and dec.is_ai:
-                self.after(300, self._ai_step)
+        player = self.engine.decision_player()
+        if player is None:
             return
-        # M18 伯爵城：重部署回合 / 进城部署
-        if self.engine.phase == "redeploy":
-            st = self.engine.redeploy_state()
-            if st is not None:
-                if self.engine.players[st["player"]].is_ai:
-                    self.after(300, self._ai_step)
-                else:
-                    self.after(250, self._prompt_redeploy)
+        if player.is_ai:
+            if not self._ai_paused and self._ai_job is None and self._ai_after_id is None:
+                self._ai_after_id = self.after(self._ai_delay.get(), self._ai_step)
             return
-        if self.engine.phase == "count_deploy":
-            if self.engine.players[self.engine._placer_idx].is_ai:
-                self.after(300, self._ai_step)
-            else:
-                self.after(250, self._prompt_count_deploy)
-            return
-        if self.engine.phase == "castle" and self.engine._castle_queue:
-            meta = self.engine.board._meta[self.engine._castle_queue[0]]
-            winners, _t = (self.engine._city_majority(meta) if meta.mayors
-                           else meeple_majority(meta.meeples))
-            occ = self.engine._player_by_color(
-                winners[0] if winners else self.engine.current_player().color)
-            if occ.is_ai:
-                self.after(300, self._ai_step)
-            else:
-                self.after(250, self._prompt_castle)
-            return
-        if self.engine.phase == "bazaar":
-            b = self.engine.bazaar
-            if b:
-                if b["phase"] == "select":
-                    idx = b["selector"]
-                elif b["phase"] == "bid":
-                    idx = b.get("bid_turn")
-                else:
-                    idx = b["selector"]
-                if self.engine.players[idx].is_ai:
-                    self.after(300, self._ai_step)
-                else:
-                    self.after(250, self._prompt_bazaar)
-            return
-        # M20 迷你扩展阶段（决策者=当前回合玩家或轮次玩家）
-        if self.engine.phase in ("gold", "magewitch", "tunnel", "escape"):
-            if self.engine.players[self.engine.turn_idx].is_ai:
-                self.after(300, self._ai_step)
-            else:
-                self.after(250, self._maybe_prompt_special)
-            return
-        if self.engine.phase == "crop" and self.engine.crop:
-            idx = (self.engine._placer_idx if self.engine.crop["mode"] is None
-                   else self.engine.crop["order"][self.engine.crop["pos"]])
-            if self.engine.players[idx].is_ai:
-                self.after(300, self._ai_step)
-            else:
-                self.after(250, self._maybe_prompt_special)
-            return
-        if self.engine.phase == "robber" and self.engine.robber_phase:
-            idx = self.engine.robber_phase["order"][
-                self.engine.robber_phase["pos"]]
-            if self.engine.players[idx].is_ai:
-                self.after(300, self._ai_step)
-            else:
-                self.after(250, self._maybe_prompt_special)
-            return
-        if self.engine.phase == "shepherd":
-            if self.engine.players[self.engine.turn_idx].is_ai:
-                self.after(300, self._ai_step)
-            else:
-                self.after(250, self._maybe_prompt_special)
-            return
-        if self.engine.phase == "plague" and self.engine.plague:
-            idx = self.engine.plague["order"][int(self.engine.plague["pos"])]
-            if self.engine.players[idx].is_ai:
-                self.after(300, self._ai_step)
-            else:
-                self.after(250, self._maybe_prompt_special)
-            return
-        p = self.engine.current_player()
-        if p.is_ai:
-            self.after(420, self._ai_step)
+        prompt = {"redeploy": self._prompt_redeploy,
+                  "count_deploy": self._prompt_count_deploy,
+                  "castle": self._prompt_castle,
+                  "bazaar": self._prompt_bazaar}.get(self.engine.phase)
+        if prompt:
+            self.after(250, prompt)
+        elif self.engine.phase in ("gold", "magewitch", "tunnel", "escape",
+                                   "crop", "robber", "shepherd", "plague"):
+            self.after(250, self._maybe_prompt_special)
+
+    def _cancel_ai(self):
+        self._ai_generation += 1
+        if self._ai_after_id is not None:
+            self.after_cancel(self._ai_after_id)
+            self._ai_after_id = None
+        if self._ai_job is not None:
+            self._ai_job["cancel"].set()
+
+    def _toggle_ai_pause(self):
+        self._ai_paused = not self._ai_paused
+        self._cancel_ai()
+        self._ai_error = None
+        self.btn_ai_pause.config(text="继续 AI" if self._ai_paused else "暂停 AI")
+        self.refresh()
+        if not self._ai_paused:
+            self.maybe_ai_turn()
+
+    def _single_ai_step(self):
+        if not self._ai_paused:
+            self._toggle_ai_pause()
+        self._ai_single_step = True
+        if self._ai_job is None:
+            self._ai_step()
 
     def _ai_step(self) -> None:
         try:
-            if not self.winfo_exists():
-                return
-        except tk.TclError:
+            self._start_ai_step()
+        except Exception as exc:
+            self._pause_ai_error(exc)
+
+    def _start_ai_step(self):
+        self._ai_after_id = None
+        if not self.winfo_exists() or self.net_mode or self.engine is None:
             return
-        if self.net_mode:
-            return
-        eng = self.engine
-        if eng.game_over:
+        if self.engine.game_over:
             self._finish()
             return
-        p = eng.current_player()
-        bot = self.bots.get(p.idx)
-        if bot is None and eng.phase not in (
-                "dragon", "redeploy", "count_deploy", "castle", "bazaar",
-                "gold", "magewitch", "tunnel", "escape", "crop", "robber",
-                "shepherd", "plague"):
-            return
-        if eng.phase == "dragon":
-            legal = eng.dragon_legal_steps()
-            if legal:
-                pos = bot.choose_dragon_step(eng, legal)
-                eng.dragon_move(pos)
-            self._emit_events()
-            self.refresh()
-            self.after(300, self._ai_step)
-            return
-        if eng.phase == "redeploy":
-            eng.redeploy_move(bot.choose_redeploy(eng))
-            self._emit_events()
-            self.refresh()
+        player = self.engine.decision_player()
+        if player is None or not player.is_ai:
             self.maybe_ai_turn()
             return
-        if eng.phase == "count_deploy":
-            act = bot.choose_count_deploy(eng)
-            if act is None:
-                eng.skip_count_deploy()
-            else:
-                eng.deploy_count(act["option"]["quarter"],
-                                 act["option"]["fig"],
-                                 act.get("count_move_to"))
-            self._emit_events()
-            self.refresh()
-            self.maybe_ai_turn()
+        if self._ai_job is not None or (self._ai_paused and not self._ai_single_step):
             return
-        if eng.phase == "castle":
-            bot = self.bots.get(p.idx) or BotAI("normal")
-            eng.convert_castle(bot.choose_castle(eng))
-            self._emit_events()
-            self.refresh()
-            self.maybe_ai_turn()
-            return
-        # M20 迷你扩展阶段
-        if eng.phase in ("gold", "magewitch", "tunnel", "escape"):
-            idx = eng.turn_idx
-            bot = self.bots.get(idx) or BotAI("normal")
-            if eng.phase == "gold":
-                eng.place_gold(bot.choose_gold(eng))
-            elif eng.phase == "magewitch":
-                fig, node = bot.choose_mw(eng)
-                if node is None:
-                    eng.mw_remove(fig)
-                else:
-                    eng.mw_move(fig, node)
-            elif eng.phase == "tunnel":
-                node = bot.choose_tunnel(eng)
-                if node is None:
-                    eng.tunnel_skip()
-                else:
-                    eng.tunnel_claim(node)
-            else:
-                eng.escape_move(bot.choose_escape(eng))
-            self._emit_events()
-            self.refresh()
-            self.maybe_ai_turn()
-            return
-        if eng.phase == "crop" and eng.crop:
-            idx = (eng._placer_idx if eng.crop["mode"] is None
-                   else eng.crop["order"][eng.crop["pos"]])
-            bot = self.bots.get(idx) or BotAI("normal")
-            act = bot.choose_crop(eng)
-            if eng.crop["mode"] is None:
-                eng.crop_choose(act or "A")
-            else:
-                eng.crop_act(act)
-            self._emit_events()
-            self.refresh()
-            self.maybe_ai_turn()
-            return
-        if eng.phase == "robber" and eng.robber_phase:
-            idx = eng.robber_phase["order"][eng.robber_phase["pos"]]
-            bot = self.bots.get(idx) or BotAI("normal")
-            eng.robber_place(bot.choose_robber(eng))
-            self._emit_events()
-            self.refresh()
-            self.maybe_ai_turn()
-            return
-        if eng.phase == "shepherd":
-            idx = eng.turn_idx
-            bot = self.bots.get(idx) or BotAI("normal")
-            eng.shepherd_act(bot.choose_shepherd(eng))
-            self._emit_events()
-            self.refresh()
-            self.maybe_ai_turn()
-            return
-        if eng.phase == "plague" and eng.plague:
-            idx = eng.plague["order"][int(eng.plague["pos"])]
-            bot = self.bots.get(idx) or BotAI("normal")
-            eng.plague_act(bot.choose_plague(eng))
-            self._emit_events()
-            self.refresh()
-            self.maybe_ai_turn()
-            return
-        if eng.phase == "bazaar":
-            b = eng.bazaar
-            idx = (b["selector"] if b["phase"] in ("select", "decide")
-                   else b.get("bid_turn"))
-            bot = self.bots.get(idx) or BotAI("normal")
-            act = bot.choose_bazaar(eng)
-            if not act:
-                if b["phase"] == "bid":
-                    eng.bazaar_pass()
-                elif b["phase"] == "decide":
-                    eng.bazaar_resolve(False)
-                else:
-                    eng.bazaar_select(0, 0)
-            elif act[0] == "select":
-                eng.bazaar_select(act[1], act[2] if len(act) > 2 else 0)
-            elif act[0] == "pass":
-                eng.bazaar_pass()
-            elif act[0] == "resolve":
-                eng.bazaar_resolve(bool(act[1]) if len(act) > 1 else False)
-            self.refresh()
-            self.maybe_ai_turn()
-            return
-        if eng.phase in ("place", "river"):
-            tries = 0
-            while not eng.legal_placements():
-                eng.discard_and_redraw()
-                tries += 1
-                if eng.game_over:
-                    self._finish()
+        bot = self.bots[player.idx]
+        bot.time_budget_ms = self._ai_budget.get()
+        if not self._ai_async:
+            try:
+                chosen = ai_turn.choose_action(self.engine, bot)
+            except Exception as exc:
+                self._record_ai_error(exc)
+                try:
+                    chosen = ai_turn.choose_action(self.engine, bot, neutral=True)
+                except Exception as fallback_error:
+                    self._pause_ai_error(fallback_error)
                     return
-                if tries > 20:
-                    return
-            (x, y, rot), _ = bot.choose_move(eng)
-            self.rot = rot
-            eng.place(x, y, rot)
-            self._log("🤖 %s 放置 %s" % (p.name, eng.board.tiles[(x, y)].tile_id))
-            self.refresh()
+            self._commit_ai(chosen, bot.last_stats)
+            return
+        # Tk 仅在主线程访问；工作线程只计算独立规则副本。
+        rep = self.engine.clone_for_simulation()
+        worker_bot = copy.copy(bot)
+        worker_bot.rng = random.Random()
+        worker_bot.rng.setstate(bot.rng.getstate())
+        cancel = threading.Event()
+        worker_bot.cancel_event = cancel
+        worker_bot.last_stats = {}
+        results = queue.Queue()
+        job = {"generation": self._ai_generation, "engine": self.engine,
+               "snapshot": self.engine.snapshot_dict(), "cancel": cancel,
+               "results": results, "bot": worker_bot, "player": player.idx,
+               "started": time.perf_counter()}
+        self._ai_job = job
+        def work():
+            try:
+                results.put((ai_turn.choose_action(rep, worker_bot), None))
+            except Exception as exc:
+                results.put((None, exc))
+        threading.Thread(target=work, daemon=True, name="Carcassonne-AI").start()
+        self.refresh()
+        self.after(20, self._poll_ai_result)
+
+    def _poll_ai_result(self):
+        try:
+            self._take_ai_result()
+        except Exception as exc:
+            if self._ai_job is not None:
+                self._ai_job["cancel"].set()
+            self._ai_job = None
+            self._pause_ai_error(exc)
+
+    def _take_ai_result(self):
+        if not self.winfo_exists() or self._ai_job is None:
+            return
+        job = self._ai_job
+        try:
+            chosen, error = job["results"].get_nowait()
+        except queue.Empty:
+            if (not job["cancel"].is_set() and
+                    time.perf_counter() - job["started"] > self._ai_budget.get() / 1000 + 2):
+                job["cancel"].set()
+                self._ai_generation += 1
+                self._pause_ai_error(TimeoutError("AI 计算超过时间预算"))
+            self.after(20, self._poll_ai_result)
+            return
+        self._ai_job = None
+        if (job["generation"] != self._ai_generation or job["engine"] is not self.engine
+                or job["snapshot"] != self.engine.snapshot_dict()):
+            if self._ai_single_step:
+                self._ai_step()
+            else:
+                self.maybe_ai_turn()
+            return
+        if error is not None:
+            self._record_ai_error(error)
+            try:
+                chosen = ai_turn.choose_action(self.engine, self.bots[job["player"]], neutral=True)
+            except Exception as exc:
+                self._pause_ai_error(exc)
+                return
+        else:
+            self.bots[job["player"]].rng.setstate(job["bot"].rng.getstate())
+        self._commit_ai(chosen, job["bot"].last_stats)
+
+    def _commit_ai(self, chosen, stats=None):
+        eng = self.engine
+        try:
+            ai_turn.apply_action(eng, chosen, atomic=True)
+        except Exception as exc:
+            self._record_ai_error(exc)
+            try:
+                player = eng.decision_player()
+                fallback = ai_turn.choose_action(eng, self.bots[player.idx], neutral=True)
+                ai_turn.apply_action(eng, fallback, atomic=True)
+                chosen = fallback
+            except Exception as fallback_error:
+                self._pause_ai_error(fallback_error)
+                return
+        self._ai_generation += 1
+        self._ai_single_step = False
+        self._ai_last_stats = dict(stats or {})
+        if chosen["op"] == "place":
+            self.rot = chosen["args"][2]
+        self._emit_events()
+        self.refresh()
+        if chosen["op"] == "place":
+            x, y, rot = chosen["args"]
+            self._log("🤖 放置 %s" % eng.board.tiles[(x, y)].tile_id)
             self._flash_placed(x, y)
-            self.after(360, self._ai_step)
-        elif eng.phase == "deploy":
-            # M21：塔动作优先（建塔/驻塔/赎金；无动作再常规部署）
-            tpos = bot.choose_tower_piece(eng)
-            if tpos is not None:
-                eng.tower_place(tpos[0], tpos[1])
-                self._emit_events()
-                self.refresh()
-                self.maybe_ai_turn()
-                return
-            ttop = bot.choose_tower_top(eng)
-            if ttop is not None:
-                eng.tower_deploy_top(ttop)
-                self._emit_events()
-                self.refresh()
-                self.maybe_ai_turn()
-                return
-            ridx = bot.choose_ransom(eng)
-            if ridx is not None:
-                eng.ransom(ridx)
-                self._emit_events()
-                self.refresh()
-                self.maybe_ai_turn()
-                return
-            opt = bot.choose_deploy(eng)
-            if opt is not None:
-                if opt["kind"] == "fairy":
-                    eng.deploy_fairy(tuple(opt["pos"]))
-                elif opt["kind"] == "princess":
-                    eng.deploy_princess(tuple(opt["victim"]), opt["victim_color"])
-                else:
-                    eng.deploy(opt["kind"], opt["seg"], big=bool(opt.get("big")))
-            else:
-                eng.skip_deploy()
-            self._emit_events()
+            if self._ai_follow.get():
+                self._see_cell(x, y)
+        self.maybe_ai_turn()
+
+    def _record_ai_error(self, exc):
+        # 即使 EXE 没有控制台，也保留可重放存档和阶段快照。
+        try:
+            folder = os.path.join(os.path.dirname(recorder.saves_dir()), "diagnostics")
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, "ai-%s-%d.json" %
+                                (time.strftime("%Y%m%d-%H%M%S"), time.time_ns() % 1000000))
+            data = {"error": repr(exc), "traceback": "".join(traceback.format_exception(
+                    type(exc), exc, exc.__traceback__)), "snapshot": self.engine.snapshot_dict(),
+                    "save": recorder.build_save(self.engine, self.seed, self.engine.history)}
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(data, stream, ensure_ascii=False, indent=2)
+            self._log("AI 异常，诊断已保存：%s" % path)
+        except Exception:
+            self._log("AI 异常：%s" % exc)
+
+    def _pause_ai_error(self, exc):
+        self._record_ai_error(exc)
+        self._ai_error = str(exc)
+        self._ai_paused = True
+        self._ai_single_step = False
+        self.btn_ai_pause.config(text="重试 AI")
+        try:
             self.refresh()
-            self.maybe_ai_turn()
+        except Exception:
+            self.lbl_hint.config(text="AI 发生错误，已暂停。可保存对局或重试 AI。")
+
+    def _see_cell(self, x, y):
+        px, py = self.cell_px(x, y)
+        bounds = tuple(float(v) for v in self.canvas.cget("scrollregion").split())
+        if len(bounds) == 4:
+            x0, y0, x1, y1 = bounds
+            self.canvas.xview_moveto(max(0, (px + TILE / 2 - self.canvas.winfo_width() / 2 - x0) /
+                                        max(1, x1 - x0)))
+            self.canvas.yview_moveto(max(0, (py + TILE / 2 - self.canvas.winfo_height() / 2 - y0) /
+                                        max(1, y1 - y0)))
 
     # ------------------------------------------------------------ 绘制
 
@@ -1574,7 +1675,7 @@ class App(tk.Tk):
         placing = eng.phase in ("place", "river")
         self.btn_rot.config(state="normal" if human_turn and placing else "disabled")
         if human_turn and placing:
-            ok_rots = {r for (_x, _y, r) in eng.legal_placements()}
+            ok_rots = {r for (_x, _y, r) in self._placements()}
             # 当前朝向不可行 → 旋转按钮变警示色提醒
             self.btn_rot.config(
                 bg="#b5482f" if ok_rots and self.rot not in ok_rots else "#5a6b3f")
@@ -1590,11 +1691,21 @@ class App(tk.Tk):
         if eng.game_over:
             self.lbl_hint.config(text="")
         elif not human_turn:
-            self.lbl_hint.config(text="等待对方玩家……" if self.net_mode
-                                 else "AI 思考中……")
+            if self.net_mode:
+                hint = "等待对方玩家……"
+            elif self._ai_error:
+                hint = "AI 发生错误，已暂停。可保存对局或点击「重试 AI」。"
+            elif self._ai_paused:
+                hint = "AI 已暂停；点击「单步」推进一次行动，或继续 AI。"
+            else:
+                player = eng.decision_player()
+                hint = "%s 正在行动（%s）……" % (player.name if player else "AI", self.lbl_phase.cget("text"))
+                if self._ai_last_stats.get("elapsed_ms") is not None:
+                    hint += "\n上次选步 %.0f 毫秒" % self._ai_last_stats["elapsed_ms"]
+            self.lbl_hint.config(text=hint)
         elif eng.phase == "place":
             if eng.can_place_anywhere():
-                ok_rots = sorted({r for (_x, _y, r) in eng.legal_placements()})
+                ok_rots = sorted({r for (_x, _y, r) in self._placements()})
                 self.lbl_hint.config(
                     text="点击高亮格放置；R 旋转（当前朝向 %s）\n可行朝向：%s" %
                          (["北", "东", "南", "西"][self.rot],
@@ -1615,6 +1726,9 @@ class App(tk.Tk):
             meeples.extend(sorted((n, c, s) for n, c, s in meta.meeple_nodes))
             for key, nodes in sorted(meta.figure_nodes.items()):
                 figures.extend((key[0], key[1], tuple(nodes)))
+            for kind in ("mayors", "wagons", "barns"):
+                figures.extend((kind, color, node)
+                               for color, node in sorted(getattr(meta, kind).items()))
         bridges = tuple(sorted((p[0], p[1], a)
                                for p, a in eng.board.bridges.items()))
         castles = tuple(sorted((c["owner"], tuple(c["tiles"]), c["scored"])
@@ -1638,6 +1752,10 @@ class App(tk.Tk):
         fp = self._static_fingerprint(eng)
         if fp != getattr(self, "_static_fp", None):
             self._static_fp = fp
+            if id(eng.board) != getattr(self, "_drawn_board_id", None):
+                cv.delete("tiles")
+                self._drawn_tiles = set()
+                self._drawn_board_id = id(eng.board)
             cv.delete("static")
             self._draw_static_layer(cv, eng)
         cv.delete("dyn")
@@ -1660,7 +1778,7 @@ class App(tk.Tk):
         # 合法格高亮（动态）
         if (eng.phase in ("place", "river") and not eng.game_over
                 and self._my_turn()):
-            for (x, y, r) in eng.legal_placements():
+            for (x, y, r) in self._placements():
                 if r != self.rot:
                     continue
                 px, py = self.cell_px(x, y)
@@ -1700,10 +1818,7 @@ class App(tk.Tk):
                                 outline="white", width=4, tags="dyn")
 
         # 龙阶段：合法步提示（当前决策者视角）
-        if (eng.phase == "dragon" and not eng.game_over
-                and self.net_mode and eng.dragon["decider"] == self.my_seat
-                or (eng.phase == "dragon" and not self.net_mode
-                    and not eng.current_player().is_ai)):
+        if eng.phase == "dragon" and not eng.game_over and self._my_turn():
             for pos in eng.dragon_legal_steps():
                 px, py = self.cell_px(*pos)
                 cv.create_rectangle(px + 4, py + 4, px + TILE - 4, py + TILE - 4,
@@ -1713,7 +1828,7 @@ class App(tk.Tk):
         if (eng.phase in ("place", "river") and self.hover_cell
                 and self._my_turn()):
             x, y = self.hover_cell
-            if (x, y, self.rot) in eng.legal_placements():
+            if (x, y, self.rot) in self._placements():
                 px, py = self.cell_px(x, y)
                 self._draw_tile_sprite(cv, eng.current_tile, self.rot,
                                        px, py, TILE, "ghost", ghost=True)
@@ -1736,14 +1851,17 @@ class App(tk.Tk):
         """静态层：地牌 + 在场米宝 + T&B 图元（指纹变化时才重绘）。"""
         # 地牌
         for (x, y), pt in eng.board.tiles.items():
+            if pt in self._drawn_tiles:
+                continue
+            self._drawn_tiles.add(pt)
             d = eng.board.defs[(x, y)]
             px, py = self.cell_px(x, y)
-            self._draw_tile_sprite(cv, d, pt.rot, px, py, TILE, "static")
+            self._draw_tile_sprite(cv, d, pt.rot, px, py, TILE, "tiles")
             if pt.placed_by >= 0:
                 cv.create_text(px + TILE - 4, py + TILE - 6,
                                text=eng.players[pt.placed_by].name[0],
                                font=FONT_S, fill=COLOR_HEX[eng.players[pt.placed_by].color],
-                               anchor="e", tags="static")
+                               anchor="e", tags="tiles")
         # M20 金块 / 隧道令牌 / 法师女巫
         for (gx, gy), n in eng.gold_map.items():
             if (gx, gy) not in eng.board.tiles:
@@ -1761,7 +1879,7 @@ class App(tk.Tk):
                                 *self.cell_px(node[0], node[1]))
             cv.create_text(ax, ay - 10, text="🚇",
                            font=("Segoe UI Emoji", 11), tags="static")
-            cv.create_text(ax + 12, ay + 8, text=color[0],
+            cv.create_text(ax + 12, ay + 8, text=art.meeple_badge(color),
                            font=FONT_S, fill=COLOR_HEX.get(color, "#fff"),
                            tags="static")
         for fig, emoji in (("mage", "🧙"), ("witch", "🧙‍♀️")):
@@ -1803,7 +1921,8 @@ class App(tk.Tk):
             if top:
                 cv.create_text(px + 6, py + 26, text="🗼",
                                font=("Segoe UI Emoji", 13), tags="static")
-                cv.create_text(px + 22, py + 30, text=top["color"][0],
+                cv.create_text(px + 22, py + 30,
+                               text=art.meeple_badge(top["color"]),
                                font=FONT_S,
                                fill=COLOR_HEX.get(top["color"], "#fff"),
                                tags="static")
@@ -2029,7 +2148,8 @@ class App(tk.Tk):
         for p in self.engine.players:
             row = tk.Frame(self.players_box, bg="#39422e")
             row.pack(fill="x", pady=1)
-            tk.Label(row, text="●", font=("Microsoft YaHei", 13),
+            tk.Label(row, text=art.meeple_badge(p.color),
+                     font=("Microsoft YaHei", 12, "bold"),
                      fg=COLOR_HEX[p.color], bg="#39422e", width=2).pack(side="left")
             name = p.name + (" 🤖" if p.is_ai else "")
             tk.Label(row, text=name, font=FONT_S, bg="#39422e", fg="#e8e0c4",
@@ -2145,6 +2265,7 @@ class App(tk.Tk):
         if self._finished or self.engine is None:
             return
         self._finished = True
+        sound.play("big")
         eng = self.engine
         self.lbl_turn.config(text="对局结束 · %s" % (eng.winner_text()))
 
@@ -2175,6 +2296,7 @@ class App(tk.Tk):
         if self._finished:
             return
         self._finished = True
+        sound.play("big")
         evs = self.engine.final_scoring()
         for ev in evs:
             self._log("🏁 %s：%s" % (ev.detail or ev.reason,

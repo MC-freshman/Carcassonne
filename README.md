@@ -2,7 +2,13 @@
 
 基础版卡卡颂完整规则实现：72 张地牌、本地热座 2–6 人、三档 AI、局域网联机。
 规则依据 CAR v7.4（Complete Annotated Rules；官方 PDF 因版权不入库，本地开发可放在 `docs/S-CAR_v7.4.pdf`）。
-当前版本 **v0.15.1**（M1–M21 全部完成：基础版 + 大扩展「客栈与大教堂 / 商人与建造者 / 公主与龙 / 修道院与市长 / 国王与强盗男爵 / 河流 II / 教堂与异端 / 卡卡颂伯爵 / 桥城堡集市 / 塔 / 山丘与羊 / 命运之轮」+ 迷你扩展八件套「围攻 / 节日 / 金矿 / 法师与女巫 / 强盗 / 麦田怪圈 / 隧道 / 幽灵」共 20 个扩展开关；联机增强 + 前瞻 AI + 一键发布管线。排期见 `docs/里程碑方案.md`，发布记录见 `docs/发布记录.md`）。
+当前版本 **v0.16.1**（M1–M21 全部完成：基础版 + 大扩展「客栈与大教堂 / 商人与建造者 / 公主与龙 / 修道院与市长 / 国王与强盗男爵 / 河流 II / 教堂与异端 / 卡卡颂伯爵 / 桥城堡集市 / 塔 / 山丘与羊 / 命运之轮」+ 迷你扩展八件套「围攻 / 节日 / 金矿 / 法师与女巫 / 强盗 / 麦田怪圈 / 隧道 / 幽灵」共 20 个扩展开关；联机增强 + 前瞻 AI + 一键发布管线。排期见 `docs/里程碑方案.md`，发布记录见 `docs/发布记录.md`）。
+
+全扩展 AI 稳定性修复与优化见 [AI修复与优化](docs/AI修复与优化.md)。单机支持后台思考、暂停/单步、播放速度与跟随落牌；全20扩展真实 AI 动作矩阵和 Tk 后台回归已纳入发布门禁。
+
+**最新发布：v0.16.1（2026-10-09）**，从 [GitHub Releases](https://github.com/MC-freshman/Carcassonne/releases/latest)
+下载 Windows 便携 ZIP，解压后双击 `卡卡颂.exe`。本版修复全扩展 AI 的塔抓捕、传送门部署、
+幽灵与大型随从归还、龙阶段行动者及缺失牌面，新增后台思考和观战控制；发布页附使用说明与 SHA256 校验清单。
 
 ## 快速开始
 
@@ -23,7 +29,8 @@ python build_release.py        # 一键发布：验证门禁 → EXE + 便携 zi
 # 全部验证（约 2 分钟）
 python -m pytest game/tests -q && python verify_v1.py 20 \
   && python verify_v1.py 8 --inns --traders --king --river --shrine --count --bcb --mini --tower --hs --wheel \
-  && python verify_ai.py && python verify_ui.py && python verify_interact.py \
+  && python verify_ai.py && python verify_ai.py --mini --bench 8 \
+  && python verify_ui.py && python verify_interact.py \
   && python verify_network.py && python verify_netui.py
 ```
 
@@ -53,6 +60,8 @@ python -m pytest game/tests -q && python verify_v1.py 20 \
 | 无处可放 | 「弃牌重抽」按钮自动变为可用（需确认全员同意的规则场景） |
 | 部署随从 | 放牌后点击牌上黄色圆钮（骑士/强盗/僧侣/农夫），或点面板按钮 / 「跳过部署」 |
 | 终局 | 牌堆摸空自动终局结算（未完成特征 + 农场），弹出结算窗 |
+| 存档/续局 | 菜单「文件 → 另存为…」（Ctrl+S）/「读取存档…」；本地局随时保存，续局重放全部已发生操作 |
+| 视图与音效 | 中键/右键拖动平移；高分屏自动按 DPI 缩放（`CARCASSONNE_NO_DPI=1` 可回退）；菜单「选项」可关音效 |
 
 ## 目录结构（文件地图）
 
@@ -64,16 +73,18 @@ Carcassonne/
 │   ├── board.py                  # 稀疏棋盘 + 城市/道路/农场/修道院并查集（特征连通）
 │   ├── engine.py                 # 规则引擎：回合流程/放置/米宝/计分/终局/快照序列化
 │   ├── bot_ai.py                 # AI 三档：easy 随机 / normal 贪心 / hard 争夺+农场
-│   ├── art.py                    # 素材生成器：PIL 渲染牌面/米宝/计分板贴图
+│   ├── art.py                    # 素材生成器：PIL 渲染牌面/米宝/计分板贴图（SpriteStore 支持按 DPI 精确缩放）
 │   ├── ui.py                     # App 主类（布局/交互/AI/联机适配）
 │   ├── ui_common.py              # UI 共享常量与程序化绘制
 │   ├── ui_dialogs.py             # 对话框：模式选择/开局设置/联机 IP
+│   ├── recorder.py               # 本地存档：操作录制代理 + 重放 + 存取档
+│   └── sound.py                  # 事件音效（winsound 合成 wav，异步）
 │   ├── main.py                   # 启动器：模式选择（单机/建房/加入）
 │   ├── net/
 │   │   ├── protocol.py           # TCP 帧协议：4 字节长度前缀 + JSON
-│   │   ├── server.py             # 主机权威服务器：校验操作/代打 AI/断线重连
+│   │   ├── server.py             # 主机权威服务器：校验操作/代打 AI/断线重连（每座位发送队列+写线程）
 │   │   └── client.py             # 联机客户端：读线程 + 消息队列
-│   └── tests/                    # 88 个黄金用例（基础规则 + 各扩展各一组）
+│   └── tests/                    # 黄金用例（基础规则 + 各扩展各一组 + 存档重放）
 ├── verify_v1.py                  # 牌面校验 + 随机完整对局回归（2-4 人）
 ├── verify_ai.py                  # AI 对 AI 全档位对战合法性验证
 ├── verify_ui.py                  # UI 无头自动化完整对局
@@ -143,9 +154,9 @@ Carcassonne/
 
 | 脚本 | 覆盖 | 跑法 |
 |---|---|---|
-| `pytest game/tests` | 88 个黄金用例（基础规则 + 各扩展各一组） | 秒级 |
+| `pytest game/tests` | 黄金用例（基础规则 + 各扩展各一组）+ 存档重放往返一致性 | 秒级 |
 | `verify_v1.py [N] [--inns/--traders/--king/--river/--shrine/--count/--bcb/--mini/--tower/--hs/--wheel]` | 牌面数据校验 + N 局随机完整对局（含弃牌重抽与守恒断言） | 20 局 ≈ 数秒 |
-| `verify_ai.py` | 三档 AI 对战：出牌合法、对局收敛、米宝归还 | 秒级 |
+| `verify_ai.py [--bench N] [--inns/--traders/--mini]` | 三档 AI 对战：合法性/收敛/米宝归还；`--bench` 输出胜率梯度（含特殊阶段驱动的迷你扩展档） | 秒级–数十秒 |
 | `verify_ui.py` | UI 无头完整对局：控件存在、布局不塌、终局可达 | 数秒 |
 | `verify_interact.py` | 事件驱动交互：点击放置/旋转/非法格提示/滚动后坐标一致/滚动不被拉回 | 数秒 |
 | `verify_network.py` | 协议层八场景：双人类/断线重连/人+AI/踢人/九扩展/迷你+塔+羊+轮 | 数十秒 |
@@ -155,6 +166,9 @@ Carcassonne/
 
 | 日期 | 问题 | 根因与修复 |
 |---|---|---|
+| 2026-10-07 | 山丘与羊/命运之轮 + AI 局必崩 | `BotAI._best_deploy` 遇牧羊人/王冠位选项落入通用分支 `KeyError` → 增加占位图元权重分支（verify_ai 补 `--mini` 档防回归） |
+| 2026-10-07 | 联机重连偶发「加入超时」 | 广播在引擎主锁内阻塞 `sendall`，僵死客户端冻结全场；重连时旧写线程还可能吞掉新连接应答 → 每座位独立发送队列 + 写线程（锁外发送、每连接独立队列），30 局压力回归通过 |
+| 2026-10-07 | AI hard 前瞻在迷你扩展下静默失效、农场估值缺位 | 前瞻模拟只处理 deploy 阶段（迷你阶段断言失败即整候选作废）→ `_drive_sim` 驱动完整阶段机；农场估值死代码 `+= 0.0` 实现为毗邻城口径 |
 | 2026-09-12 | 全开扩展随机局终局米宝不守恒 | 改建城堡时多数方多枚随从只留 1 枚作标记，其余被吞 → 多余随从立即归还供给 |
 | 2026-09-12 | 驻塔在仅剩大型米宝时崩溃 | `tower_deploy_top` 默认扣普通米宝 → 耗尽时自动改用大型米宝 |
 | 2026-09-05 | 联机 P&D 局人类玩家无法移动龙（服务器报"未知消息 drag"） | 消息分发白名单漏了 `drag`，龙移动处理器是死代码 → 白名单加入 `drag`；龙阶段改按轮值决定者校验（非当前回合玩家亦可动）；`verify_network` 新增场景 7 防回归 |

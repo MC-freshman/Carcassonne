@@ -78,6 +78,11 @@ def write_docs() -> None:
 
 四、规则
   基础版 72 张地牌完整实现，规则依据 CAR v7.4（docs/S-CAR_v7.4.pdf）。
+
+AI 观战：单机顶部「暂停 AI / 单步」；菜单「AI 观战」可设置播放速度、
+思考时间及跟随落牌。后台思考期间仍可操作窗口、保存或暂停对局。
+如 AI 遇到无法恢复的错误，会明确暂停并提供重试；诊断保存在
+用户目录 .carcassonne/diagnostics，可用于定位与重放。
   计分口径：城市 2 分/牌+2 分/旗帜；道路 1 分/牌；修道院 9 分；
   终局农场按第三版规则（完成城市 3 分/个）；多数者得分、平局均得。
 
@@ -88,6 +93,15 @@ def write_docs() -> None:
 """
     note = """卡卡颂 · 桌游模拟器  版本说明
 ================================
+
+v0.16.1（2026-10-09）
+  - 修复：全扩展 AI 传送门部署越界及目标坐标丢失；三人以上塔抓捕错误
+  - 修复：幽灵/大型随从部署与归还；传送门误提供已占修道院；龙阶段行动者
+  - 修复：全扩展牌面 PNG 生成遗漏；缺失素材时回退程序绘制
+  - 优化：AI 后台计算、思考预算、过期结果取消、错误诊断与合法动作恢复
+  - 优化：规则模拟副本、合法落点缓存、地牌增量绘制、道路/农场估值
+  - 新增：暂停/单步、播放速度、思考时间与跟随落牌
+  - 验证：全20扩展 2–6 人×三难度×失败种子矩阵、真实 Tk 后台回合回归
 
 v0.15.2（2026-09）
   - 【新】开局设置与建房对话框的扩展开关改为可折叠面板：默认折叠只占一行
@@ -358,16 +372,28 @@ def check_compile() -> None:
 def run_release_gate() -> None:
     """发布门禁：语法 → 牌面校验+随机对局 → UI 全流程。任一失败即中止。"""
     check_compile()
+    print("[门禁] 规则与 AI 单元回归……")
+    r = subprocess.run([sys.executable, "-m", "pytest", "game/tests", "-q"], cwd=ROOT)
+    if r.returncode != 0:
+        sys.exit("发布门禁失败：单元回归未通过，中止构建")
     print("[门禁] 牌面校验 + 随机对局（verify_v1 6 局）……")
     r = subprocess.run([sys.executable, os.path.join(ROOT, "verify_v1.py"),
                         "6"], cwd=ROOT)
     if r.returncode != 0:
         sys.exit("发布门禁失败：verify_v1 未通过，中止构建")
+    print("[门禁] 全20扩展 AI 真实动作回归（2–6 人 / 三难度 / 固定失败种子）……")
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "verify_ai.py"),
+                        "--all"], cwd=ROOT)
+    if r.returncode != 0:
+        sys.exit("发布门禁失败：全扩展 AI 未通过，中止构建")
     print("[门禁] UI 全流程（verify_ui，会短暂弹出游戏窗口）……")
     r = subprocess.run([sys.executable, os.path.join(ROOT, "verify_ui.py")],
                        cwd=ROOT)
     if r.returncode != 0:
         sys.exit("发布门禁失败：verify_ui 未通过，中止构建")
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "verify_ai_ui.py")], cwd=ROOT)
+    if r.returncode != 0:
+        sys.exit("发布门禁失败：后台 AI/UI 未通过，中止构建")
     print("[门禁] 全部通过")
 
 
@@ -474,7 +500,9 @@ def main() -> None:
         os.path.join(ROOT, "game", "main.py"),
     ]
     print("[3/6] PyInstaller 打包中（约 1-2 分钟）……")
-    r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+    build_env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", env=build_env)
     if r.returncode != 0:
         print(r.stdout[-4000:])
         print(r.stderr[-4000:])
@@ -492,7 +520,10 @@ def main() -> None:
 
     # 清理中间产物（dist 与 release 重复，spec 为临时配置）
     for d in ("build", "dist"):
-        shutil.rmtree(os.path.join(ROOT, d), ignore_errors=True)
+        target = os.path.realpath(os.path.join(ROOT, d))
+        if os.path.commonpath([os.path.realpath(ROOT), target]) != os.path.realpath(ROOT):
+            raise RuntimeError("构建清理路径越出项目目录：%s" % target)
+        shutil.rmtree(target, ignore_errors=True)
     for f in ("卡卡颂.spec", EXE_NAME + ".spec"):
         p = os.path.join(ROOT, f)
         if os.path.exists(p):
