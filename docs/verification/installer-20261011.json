@@ -1,0 +1,17 @@
+{
+  "date": "2026-10-11",
+  "NSIS": "3.12 portable",
+  "installer_sha256": "d52244a32f48fe1a0d3d864688c5de36cfbe85f006be307e24f041b2e2e063e0",
+  "included_exe_sha256": "ab1eb18f75b3636ecf58be58638dec7d7f48dad2d01855f22ae4900710d00baa",
+  "silent_install_and_hash_match": true,
+  "launch": {
+    "executable": "卡卡颂.exe",
+    "windowOpened": true,
+    "title": "卡卡颂 · 选择模式"
+  },
+  "uninstall": {
+    "uninstallRemovedExecutable": true,
+    "savePreserved": true
+  },
+  "signed": false
+}

@@ -21,37 +21,20 @@ def scripted_engine(tile_seq, expansions=("inns", "traders", "pd", "abbey")):
 
 class AbbeyPlacementTest(unittest.TestCase):
     def test_abbey_plays_without_edge_match(self):
-        """修道院牌可放边不匹配的相邻空格（8 邻齐 → 9 分）。"""
-        eng = scripted_engine([
-            td.by_id("AM-Abbey"),   # 红 (1,0)：W=f 接起始 E=f（边匹配放）
-            td.by_id("C1s"),        # 红 (1,-1) r0：N=c 城口——(1,0) N=f 之上的缺口
-            td.by_id("AM-Abbey"),   # 红 (1,-1)?? 已占——用 (2,0)
-        ])
-        # 布局：起始 (0,0)；红先放 Abbey @ (1,0)（W=f 接起始 E=f）
+        """修道院可封闭相邻城市开口，实际落牌也应成功。"""
+        eng = scripted_engine([td.by_id("AM-Abbey"), td.by_id("C1s"),
+                               td.by_id("AM-Abbey")])
         eng.place(1, 0, 0)
-        eng.deploy(KIND_MON, 0)          # 红僧侣 @ (1,0)
-        # 蓝 (1,-1) C1s r0：N=c 面 (1,-2) 空；W=f 面 (0,-1) 空；S=f 面 (1,0) N=f ✓
+        eng.deploy(KIND_MON, 0)
         eng.place(1, -1, 0)
         eng.skip_deploy()
-        # 红 Abbey @ (2,-1)?? 需相邻 (1,-1)。边不匹配验证：
-        # (2,-1) 的 W 邻 (1,-1) E=f——AM-Abbey 全田 W=f ✓ 其实匹配。
-        # 真正"边不匹配"验证：AM 放在 (1,0) 的 N 邻 (1,-1)——已被占。
-        # 用 (2,0)：W 邻 (1,0) E=f ✓ 匹配——也不行。
-        # 改用强制验证：place 合法但不匹配 —— (2,-1) W=f vs (1,-1) E=f 均田。
-        # 构造不匹配场景：C1s @ (2,0) r0 后 (2,-1) E 边=c?? 简化：直接断言
-        # abbey 牌的 legal 位含"与已放牌相邻但边不匹配"的位置。
-        eng2 = scripted_engine([td.by_id("AM-Abbey"), td.by_id("C1s"),
-                                td.by_id("AM-Abbey")])
-        eng2.place(1, 0, 0)
-        eng2.deploy(KIND_MON, 0)
-        eng2.place(1, -1, 0)     # 蓝 C1s r0（N=c 城开口）
-        eng2.skip_deploy()
-        # 红 Abbey @ (2,0)：W=f 接 (1,0) E=f ✓ 匹配；@ (2,-1)：W=f 接 (1,-1) E=f ✓
-        # 边不匹配演示：C1s 的 N=c——若 (1,-1) N=c 而 (1,-2) 的 S=f → 不匹配
-        # Abbey 可放 —— (1,-2) S=f 面: (1,-1) N=c → 不匹配但 Abbey 允许
-        legal = eng2.legal_placements()
-        self.assertIn((1, -2, 0), legal, "修道院牌可放边不匹配缺口")
-        self.skipTest("边不匹配断言由 (1,-2,0) 合法性隐式覆盖" if False else "")
+        from game.models import N, S
+        abbey = td.by_id("AM-Abbey")
+        neighbor = td.by_id("C1s")
+        self.assertNotEqual(abbey.edge(S), neighbor.edge(N))
+        self.assertIn((1, -2, 0), eng.legal_placements())
+        eng.place(1, -2, 0)
+        self.assertIn((1, -2), eng.board.tiles)
 
 
 class MayorTest(unittest.TestCase):

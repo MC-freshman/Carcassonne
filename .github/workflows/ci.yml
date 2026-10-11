@@ -22,7 +22,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install Pillow pytest
       - name: Syntax check (compileall)
-        run: python -m compileall -q game verify_v1.py verify_ai.py verify_ui.py verify_interact.py verify_network.py verify_netui.py build_release.py
+        run: python -m compileall -q game verify_v1.py verify_ai.py verify_ai_ui.py verify_ui.py verify_interact.py verify_network.py verify_netui.py build_release.py build_installer.py
       - name: Unit tests
         run: python -m pytest game/tests -q
       - name: Random full games
